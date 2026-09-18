@@ -20,6 +20,6 @@ Run `devbox run validate` before submitting changes. Run `devbox run setup-hooks
 - SwiftLint's analyzer checks unused declarations/imports from a clean verbose compiler log. A formatting-only check is not a substitute for compilation or analysis.
 - UniFFI-generated code is excluded from style/analyzer checks. It still compiles under Swift 6 and warnings-as-errors. Fix the generator/configuration for generated-code issues rather than editing generated files.
 
-`devbox run check-rust` runs the Rust gates; `devbox run check-swift` runs the Apple gates. `devbox run validate` runs both on Apple Silicon macOS and Rust checks on Linux. Xcode supplies Swift and Apple SDKs; Devbox pins the linter/formatter versions. The initial Apple CI runner is Apple Silicon to match the supported Devbox package set.
+`devbox run check-rust` runs the Rust gates; `devbox run check-swift` runs the Apple gates. `devbox run validate` runs both on Apple Silicon macOS and Rust checks on Linux. Xcode supplies Swift and Apple SDKs; Devbox pins the linter/formatter versions. Apple scripts clear Nix SDK overrides and select the active Xcode so SourceKit and SwiftPM use the real Swift toolchain. The initial Apple CI runner is Apple Silicon to match the supported Devbox package set.
 
 Tracked pre-commit hooks run formatting, Clippy, SwiftLint and SwiftFormat; pre-push runs full validation. These are useful local checks but can be bypassed by Git flags. Required CI status checks must also be enabled in the hosting service's branch protection when a remote repository is configured.
