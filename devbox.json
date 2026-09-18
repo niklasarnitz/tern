@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.2/.schema/devbox.schema.json",
+  "packages": [
+    "rustc@1.97.1",
+    "cargo@1.97.1",
+    "rustfmt@1.97.1",
+    "clippy@1.97.1"
+  ],
+  "shell": {
+    "scripts": {
+      "test": "cargo test --manifest-path core/Cargo.toml --workspace --locked",
+      "check": "cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings",
+      "fmt": "cargo fmt --manifest-path core/Cargo.toml --all -- --check",
+      "bindings": "bash scripts/generate-bindings.sh",
+      "macos": "bash scripts/run-macos.sh"
+    }
+  },
+  "env": {
+    "CARGO_HOME": "$PWD/.devbox/cargo"
+  }
+}

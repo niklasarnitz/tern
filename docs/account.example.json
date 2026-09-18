@@ -1,0 +1,9 @@
+{
+  "id": "personal",
+  "email": "you@example.com",
+  "display_name": "Personal",
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "username": "you@example.com",
+  "credential_ref": "tern/personal/imap"
+}

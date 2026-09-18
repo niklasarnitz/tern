@@ -1,0 +1,9 @@
+.devbox/
+core/target/
+apple/.build/
+apple/Generated/
+apple/Frameworks/
+.DS_Store
+*.sqlite*
+*.db
+.env
