@@ -1479,6 +1479,7 @@ name = "mail-imap"
 version = "0.1.0"
 dependencies = [
  "async-imap",
+ "base64 0.22.1",
  "chrono",
  "imap-proto",
  "mail-mime",
@@ -1486,6 +1487,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-native-certs",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",

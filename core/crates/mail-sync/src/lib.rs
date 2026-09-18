@@ -1,7 +1,8 @@
 //! Orchestration owns protocol-to-database transitions; frontends never own IMAP.
 use mail_db::Database;
-use mail_model::{Account, Mailbox};
+use mail_model::{Account, DraftSyncStatus, Mailbox, RemoteDraft};
 use std::{
+    collections::{BTreeMap, HashSet},
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -28,6 +29,13 @@ pub enum SyncError {
     CredentialUnavailable,
     #[error("Mail synchronization failed: {0}")]
     Sync(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftSyncResult {
+    pub downloaded: u32,
+    pub uploaded: u32,
+    pub conflicts_preserved: u32,
 }
 
 /// Discover mailboxes, replay expired durable moves, and fetch Inbox headers.
@@ -234,5 +242,150 @@ mod tests {
             assert!(delay >= ceiling / 2);
             assert!(delay <= ceiling);
         }
+    }
+}
+
+/// Reconcile Tern-managed drafts with the provider's Drafts mailbox.
+///
+/// Local edits are never discarded. If the server advanced from the local base,
+/// the local edit is forked to a new draft before the remote version is applied.
+/// Equal-revision divergent server copies are likewise preserved before stale UIDs
+/// are removed. Each upload is acknowledged only if no newer local save raced it.
+///
+/// # Errors
+/// Returns an error if credentials, safe IMAP replacement, or local persistence fails.
+pub async fn sync_drafts(
+    db: &Database,
+    account: &Account,
+    credentials: &dyn CredentialProvider,
+) -> Result<DraftSyncResult, SyncError> {
+    let password = credentials.password(&account.credential_ref)?;
+    let snapshot = mail_imap::fetch_drafts(account, &password)
+        .await
+        .map_err(sync_error)?;
+    let now = unix_timestamp()?;
+    let mut result = DraftSyncResult::default();
+    let mut stale_uids = Vec::new();
+    let mut groups = BTreeMap::<String, Vec<RemoteDraft>>::new();
+    for remote in snapshot.drafts {
+        groups
+            .entry(remote.draft_id.clone())
+            .or_default()
+            .push(remote);
+    }
+
+    for remotes in groups.values_mut() {
+        remotes.sort_by_key(|remote| (remote.revision, remote.uid));
+        let canonical = remotes.last().cloned().ok_or_else(|| {
+            SyncError::Sync("draft reconciliation encountered an empty group".into())
+        })?;
+        for remote in remotes.iter().take(remotes.len().saturating_sub(1)) {
+            if remote.revision == canonical.revision && !same_content(remote, &canonical) {
+                db.preserve_remote_conflict(&account.id, remote, snapshot.uid_validity, now)
+                    .map_err(sync_error)?;
+                result.conflicts_preserved = result.conflicts_preserved.saturating_add(1);
+            }
+            stale_uids.push(remote.uid);
+        }
+        if db
+            .merge_remote_draft(&account.id, &canonical, snapshot.uid_validity, now)
+            .map_err(sync_error)?
+            .is_some()
+        {
+            result.conflicts_preserved = result.conflicts_preserved.saturating_add(1);
+        }
+        result.downloaded = result.downloaded.saturating_add(1);
+    }
+
+    let pending = db
+        .draft_sync_records(&account.id)
+        .map_err(sync_error)?
+        .into_iter()
+        .filter(|record| record.draft.sync_status == DraftSyncStatus::Pending)
+        .collect::<Vec<_>>();
+    let replaced_uids = pending
+        .iter()
+        .filter_map(|record| record.remote_uid)
+        .collect::<HashSet<_>>();
+    for record in pending {
+        let revision = record.remote_revision.unwrap_or(0).saturating_add(1);
+        let uploaded = mail_imap::upload_draft(
+            account,
+            &password,
+            &snapshot.remote_name,
+            &record.draft,
+            revision,
+            record.remote_uid_validity,
+            record.remote_uid,
+        )
+        .await
+        .map_err(sync_error)?;
+        db.mark_draft_synced(
+            &record.draft.id,
+            record.local_generation,
+            revision,
+            snapshot.uid_validity,
+            uploaded.uid,
+        )
+        .map_err(sync_error)?;
+        result.uploaded = result.uploaded.saturating_add(1);
+    }
+
+    stale_uids.retain(|uid| !replaced_uids.contains(uid));
+    stale_uids.sort_unstable();
+    stale_uids.dedup();
+    mail_imap::delete_draft_uids(
+        account,
+        &password,
+        &snapshot.remote_name,
+        snapshot.uid_validity,
+        &stale_uids,
+    )
+    .await
+    .map_err(sync_error)?;
+    Ok(result)
+}
+
+fn same_content(left: &RemoteDraft, right: &RemoteDraft) -> bool {
+    left.recipients == right.recipients
+        && left.cc == right.cc
+        && left.bcc == right.bcc
+        && left.subject == right.subject
+        && left.body == right.body
+}
+
+fn unix_timestamp() -> Result<i64, SyncError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SyncError::Sync("the system clock is before the Unix epoch".into()))?;
+    i64::try_from(duration.as_secs())
+        .map_err(|_| SyncError::Sync("the system clock is out of range".into()))
+}
+
+fn sync_error(error: impl std::fmt::Display) -> SyncError {
+    SyncError::Sync(error.to_string())
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn remote(uid: u32, body: &str) -> RemoteDraft {
+        RemoteDraft {
+            draft_id: "same".into(),
+            revision: 2,
+            uid,
+            recipients: vec!["one@example.test".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "subject".into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn divergent_equal_revisions_are_not_considered_duplicates() {
+        assert!(same_content(&remote(1, "one"), &remote(2, "one")));
+        assert!(!same_content(&remote(1, "one"), &remote(2, "two")));
     }
 }

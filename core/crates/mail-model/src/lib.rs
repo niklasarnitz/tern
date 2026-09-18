@@ -202,6 +202,59 @@ pub struct PendingOperation {
     pub can_replay: bool,
 }
 
+/// User-editable draft content. Saving is always a local operation; synchronization
+/// status reports whether the latest local version has reached the server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct Draft {
+    pub id: String,
+    pub account_id: String,
+    pub recipients: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub updated_at: i64,
+    pub sync_status: DraftSyncStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum DraftSyncStatus {
+    Pending,
+    Synced,
+}
+
+/// Input for an immediate local draft save. Omit `id` to create a draft.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DraftSave {
+    pub id: Option<String>,
+    pub account_id: String,
+    pub recipients: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+}
+
+/// A Tern draft as represented in the provider's Drafts mailbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDraft {
+    pub draft_id: String,
+    pub revision: u64,
+    pub uid: u32,
+    pub recipients: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftMailboxSnapshot {
+    pub remote_name: String,
+    pub uid_validity: u32,
+    pub drafts: Vec<RemoteDraft>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RemoteHeader {
     pub uid: u32,

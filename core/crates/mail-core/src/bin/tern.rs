@@ -43,9 +43,18 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// Read locally cached drafts only; makes no network connections.
+    Drafts {
+        account: String,
+    },
     /// Fetch the most recent 100 Inbox headers using verified implicit TLS.
     /// Password is prompted without echo and is never stored.
     Sync {
+        account: String,
+    },
+    /// Reconcile local drafts with the provider's Drafts mailbox.
+    /// Password is prompted without echo and is never stored.
+    SyncDrafts {
         account: String,
     },
 }
@@ -117,6 +126,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&db.list_messages(&mailbox, offset, limit)?)?
             );
         }
+        Command::Drafts { account } => {
+            let db = Database::open(database_path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&db.list_drafts(&account)?)?
+            );
+        }
         Command::Sync { account } => {
             let db = Database::open(database_path)?;
             let account = db
@@ -126,6 +142,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .ok_or("Account not found")?;
             let mailbox = mail_sync::sync_inbox(&db, &account, &PromptCredentials).await?;
             println!("{}", serde_json::to_string_pretty(&mailbox)?);
+        }
+        Command::SyncDrafts { account } => {
+            let db = Database::open(database_path)?;
+            let account = db
+                .list_accounts()?
+                .into_iter()
+                .find(|candidate| candidate.id == account)
+                .ok_or("Account not found")?;
+            let result = mail_sync::sync_drafts(&db, &account, &PromptCredentials).await?;
+            println!(
+                "Drafts synchronized: {} downloaded, {} uploaded, {} conflicts preserved",
+                result.downloaded, result.uploaded, result.conflicts_preserved
+            );
         }
     }
     Ok(())

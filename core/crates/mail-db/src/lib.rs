@@ -7,8 +7,8 @@
 use std::{collections::HashMap, ops::Deref, path::Path};
 
 use mail_model::{
-    Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader, WidgetMailboxSummary,
-    WidgetSnapshot,
+    Account, Draft, DraftSave, DraftSyncStatus, Mailbox, MailboxSnapshot, MessageSummary,
+    RemoteDraft, RemoteHeader, WidgetMailboxSummary, WidgetSnapshot,
 };
 use rusqlite::{
     params, params_from_iter, types::Type, types::Value, Connection, OptionalExtension,
@@ -18,7 +18,7 @@ mod conversations;
 mod mutations;
 mod search;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -57,6 +57,10 @@ pub enum DatabaseError {
     Serialization(#[from] serde_json::Error),
     #[error("invalid search: {message}")]
     InvalidSearch { message: String },
+    #[error("draft does not belong to account {0}")]
+    DraftAccountMismatch(String),
+    #[error("draft field contains an invalid line break")]
+    InvalidDraftHeader,
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -65,6 +69,15 @@ pub type Error = DatabaseError;
 /// A connection to the local canonical mail store.
 pub struct Database {
     connection: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftSyncRecord {
+    pub draft: Draft,
+    pub local_generation: u64,
+    pub remote_revision: Option<u64>,
+    pub remote_uid_validity: Option<u32>,
+    pub remote_uid: Option<u32>,
 }
 
 impl Database {
@@ -580,6 +593,264 @@ impl Database {
             important_messages,
         })
     }
+
+    /// Save a draft in one local transaction. Existing drafts are marked pending
+    /// and advance their local generation without changing their last known server revision.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown account, cross-account update, invalid header
+    /// content, or a `SQLite` failure.
+    pub fn save_draft(&self, save: &DraftSave, updated_at: i64) -> Result<Draft> {
+        validate_draft_save(save)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let id = match save.id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_owned(),
+            Some(_) => return Err(DatabaseError::InvalidDraftHeader),
+            None => {
+                transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?
+            }
+        };
+        let existing_account = transaction
+            .query_row(
+                "SELECT account_id FROM drafts WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_account
+            .as_deref()
+            .is_some_and(|account| account != save.account_id)
+        {
+            return Err(DatabaseError::DraftAccountMismatch(save.account_id.clone()));
+        }
+        transaction.execute(
+            "INSERT INTO drafts
+                (id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                 updated_at, sync_pending, local_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1)
+             ON CONFLICT(id) DO UPDATE SET
+                recipients_json = excluded.recipients_json,
+                cc_json = excluded.cc_json,
+                bcc_json = excluded.bcc_json,
+                subject = excluded.subject,
+                body = excluded.body,
+                updated_at = excluded.updated_at,
+                sync_pending = 1,
+                local_generation = drafts.local_generation + 1",
+            params![
+                id,
+                save.account_id,
+                encode_addresses(&save.recipients)?,
+                encode_addresses(&save.cc)?,
+                encode_addresses(&save.bcc)?,
+                save.subject,
+                save.body,
+                updated_at,
+            ],
+        )?;
+        let draft = transaction.query_row(
+            "SELECT id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                    updated_at, sync_pending FROM drafts WHERE id = ?1",
+            [&id],
+            draft_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(draft)
+    }
+
+    /// # Errors
+    /// Returns an error when `SQLite` cannot read or decode draft rows.
+    pub fn list_drafts(&self, account_id: &str) -> Result<Vec<Draft>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                    updated_at, sync_pending
+             FROM drafts WHERE account_id = ?1 ORDER BY updated_at DESC, id",
+        )?;
+        let drafts = statement
+            .query_map([account_id], draft_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(DatabaseError::from)?;
+        Ok(drafts)
+    }
+
+    /// Internal synchronization view, including optimistic server identity.
+    /// # Errors
+    /// Returns an error when `SQLite` cannot read or decode draft rows.
+    pub fn draft_sync_records(&self, account_id: &str) -> Result<Vec<DraftSyncRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                    updated_at, sync_pending, local_generation, remote_revision,
+                    remote_uid_validity, remote_uid
+             FROM drafts WHERE account_id = ?1 ORDER BY id",
+        )?;
+        let records = statement
+            .query_map([account_id], |row| {
+                Ok(DraftSyncRecord {
+                    draft: draft_from_row(row)?,
+                    local_generation: u64_from_sql(row.get(9)?, 9)?,
+                    remote_revision: row
+                        .get::<_, Option<i64>>(10)?
+                        .map(|value| u64_from_sql(value, 10))
+                        .transpose()?,
+                    remote_uid_validity: row
+                        .get::<_, Option<i64>>(11)?
+                        .map(|value| u32_from_sql(value, 11))
+                        .transpose()?,
+                    remote_uid: row
+                        .get::<_, Option<i64>>(12)?
+                        .map(|value| u32_from_sql(value, 12))
+                        .transpose()?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(DatabaseError::from)?;
+        Ok(records)
+    }
+
+    /// Merge the canonical remote version. A concurrent dirty local edit is forked
+    /// to a new pending draft before the remote version replaces the original.
+    /// Returns the fork id when a conflict was preserved.
+    /// # Errors
+    /// Returns an error when `SQLite` cannot commit the reconciliation.
+    pub fn merge_remote_draft(
+        &self,
+        account_id: &str,
+        remote: &RemoteDraft,
+        uid_validity: u32,
+        updated_at: i64,
+    ) -> Result<Option<String>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = query_sync_record(&transaction, &remote.draft_id)?;
+        let mut fork_id = None;
+        if let Some(record) = &existing {
+            if record.draft.account_id != account_id {
+                return Err(DatabaseError::DraftAccountMismatch(account_id.to_owned()));
+            }
+            if record.draft.sync_status == DraftSyncStatus::Pending
+                && !draft_matches_remote(&record.draft, remote)
+                && record.remote_revision != Some(remote.revision)
+            {
+                let id: String =
+                    transaction
+                        .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+                transaction.execute(
+                    "INSERT INTO drafts
+                        (id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                         updated_at, sync_pending, local_generation)
+                     SELECT ?1, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                            updated_at, 1, 1 FROM drafts WHERE id = ?2",
+                    params![id, remote.draft_id],
+                )?;
+                fork_id = Some(id);
+            }
+        }
+        let local_generation = existing
+            .as_ref()
+            .map_or(0, |record| record.local_generation);
+        let pending_same_base = existing.as_ref().is_some_and(|record| {
+            record.draft.sync_status == DraftSyncStatus::Pending
+                && record.remote_revision == Some(remote.revision)
+                && !draft_matches_remote(&record.draft, remote)
+        });
+        if !pending_same_base {
+            transaction.execute(
+                "INSERT INTO drafts
+                    (id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                     updated_at, sync_pending, local_generation, remote_revision,
+                     remote_uid_validity, remote_uid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                    recipients_json = excluded.recipients_json,
+                    cc_json = excluded.cc_json,
+                    bcc_json = excluded.bcc_json,
+                    subject = excluded.subject,
+                    body = excluded.body,
+                    updated_at = excluded.updated_at,
+                    sync_pending = 0,
+                    remote_revision = excluded.remote_revision,
+                    remote_uid_validity = excluded.remote_uid_validity,
+                    remote_uid = excluded.remote_uid",
+                params![
+                    remote.draft_id,
+                    account_id,
+                    encode_addresses(&remote.recipients)?,
+                    encode_addresses(&remote.cc)?,
+                    encode_addresses(&remote.bcc)?,
+                    remote.subject,
+                    remote.body,
+                    updated_at,
+                    i64::try_from(local_generation).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    i64::try_from(remote.revision).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    i64::from(uid_validity),
+                    i64::from(remote.uid),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(fork_id)
+    }
+
+    /// Preserve a divergent server copy under a fresh local id. It is pending so
+    /// the next upload gives the preserved copy its own stable server identity.
+    /// # Errors
+    /// Returns an error when `SQLite` cannot insert the conflict copy.
+    pub fn preserve_remote_conflict(
+        &self,
+        account_id: &str,
+        remote: &RemoteDraft,
+        uid_validity: u32,
+        updated_at: i64,
+    ) -> Result<String> {
+        let id: String = self.connection.query_row(
+            "SELECT 'conflict-' || lower(hex(?1)) || '-' || ?2 || '-' || ?3",
+            params![account_id, i64::from(uid_validity), i64::from(remote.uid)],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO drafts
+                (id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                 updated_at, sync_pending, local_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                id,
+                account_id,
+                encode_addresses(&remote.recipients)?,
+                encode_addresses(&remote.cc)?,
+                encode_addresses(&remote.bcc)?,
+                remote.subject,
+                remote.body,
+                updated_at,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Acknowledge an upload only if no newer local save raced with it.
+    /// # Errors
+    /// Returns an error when `SQLite` cannot update the row.
+    pub fn mark_draft_synced(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        revision: u64,
+        uid_validity: u32,
+        uid: u32,
+    ) -> Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE drafts SET sync_pending = 0, remote_revision = ?3,
+                    remote_uid_validity = ?4, remote_uid = ?5
+             WHERE id = ?1 AND local_generation = ?2",
+            params![
+                id,
+                i64::try_from(expected_generation).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                i64::try_from(revision).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                i64::from(uid_validity),
+                i64::from(uid),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
 }
 
 // Schema text stays together so each migration transaction is reviewable.
@@ -751,7 +1022,36 @@ fn migrate(connection: &Connection) -> Result<()> {
              PRAGMA user_version = 5;
              COMMIT;",
         )?;
+        version = 5;
     }
+    if version == 5 {
+        migrate_drafts(connection)?;
+    }
+    Ok(())
+}
+
+fn migrate_drafts(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE drafts (
+             id TEXT PRIMARY KEY NOT NULL,
+             account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+             recipients_json TEXT NOT NULL,
+             cc_json TEXT NOT NULL,
+             bcc_json TEXT NOT NULL,
+             subject TEXT NOT NULL,
+             body TEXT NOT NULL,
+             updated_at INTEGER NOT NULL,
+             sync_pending INTEGER NOT NULL,
+             local_generation INTEGER NOT NULL,
+             remote_revision INTEGER,
+             remote_uid_validity INTEGER,
+             remote_uid INTEGER
+         );
+         CREATE INDEX drafts_account_idx ON drafts(account_id, updated_at DESC);
+         PRAGMA user_version = 6;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -867,6 +1167,99 @@ fn backfill_threads(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn validate_draft_save(save: &DraftSave) -> Result<()> {
+    let valid_id = save.id.as_ref().is_none_or(|id| {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    });
+    let valid_header = |value: &str| !value.contains(['\r', '\n']);
+    if !valid_id
+        || !valid_header(&save.subject)
+        || save
+            .recipients
+            .iter()
+            .chain(&save.cc)
+            .chain(&save.bcc)
+            .any(|address| !valid_header(address))
+    {
+        return Err(DatabaseError::InvalidDraftHeader);
+    }
+    Ok(())
+}
+
+fn encode_addresses(addresses: &[String]) -> Result<String> {
+    serde_json::to_string(addresses).map_err(|error| {
+        DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(error.into()))
+    })
+}
+
+fn decode_addresses(value: &str, column: usize) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, error.into())
+    })
+}
+
+fn draft_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
+    Ok(Draft {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        recipients: decode_addresses(&row.get::<_, String>(2)?, 2)?,
+        cc: decode_addresses(&row.get::<_, String>(3)?, 3)?,
+        bcc: decode_addresses(&row.get::<_, String>(4)?, 4)?,
+        subject: row.get(5)?,
+        body: row.get(6)?,
+        updated_at: row.get(7)?,
+        sync_status: if row.get::<_, i64>(8)? == 0 {
+            DraftSyncStatus::Synced
+        } else {
+            DraftSyncStatus::Pending
+        },
+    })
+}
+
+fn query_sync_record<T>(connection: &T, id: &str) -> Result<Option<DraftSyncRecord>>
+where
+    T: Deref<Target = Connection>,
+{
+    connection
+        .query_row(
+            "SELECT id, account_id, recipients_json, cc_json, bcc_json, subject, body,
+                    updated_at, sync_pending, local_generation, remote_revision,
+                    remote_uid_validity, remote_uid FROM drafts WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(DraftSyncRecord {
+                    draft: draft_from_row(row)?,
+                    local_generation: u64_from_sql(row.get(9)?, 9)?,
+                    remote_revision: row
+                        .get::<_, Option<i64>>(10)?
+                        .map(|value| u64_from_sql(value, 10))
+                        .transpose()?,
+                    remote_uid_validity: row
+                        .get::<_, Option<i64>>(11)?
+                        .map(|value| u32_from_sql(value, 11))
+                        .transpose()?,
+                    remote_uid: row
+                        .get::<_, Option<i64>>(12)?
+                        .map(|value| u32_from_sql(value, 12))
+                        .transpose()?,
+                })
+            },
+        )
+        .optional()
+        .map_err(DatabaseError::from)
+}
+
+fn draft_matches_remote(draft: &Draft, remote: &RemoteDraft) -> bool {
+    draft.recipients == remote.recipients
+        && draft.cc == remote.cc
+        && draft.bcc == remote.bcc
+        && draft.subject == remote.subject
+        && draft.body == remote.body
+}
+
 fn mailbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mailbox> {
     Ok(Mailbox {
         id: row.get(0)?,
@@ -892,6 +1285,12 @@ fn u16_from_sql(value: i64, column: usize) -> rusqlite::Result<u16> {
 
 fn u32_from_sql(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
+fn u64_from_sql(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })
 }
@@ -2697,7 +3096,7 @@ mod tests {
             db.connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -2874,5 +3273,110 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].retry_count, 1);
         assert_eq!(failed[0].last_error.as_deref(), Some("sanitized failure"));
+    }
+
+    fn draft_save(id: Option<&str>, body: &str) -> DraftSave {
+        DraftSave {
+            id: id.map(str::to_owned),
+            account_id: "one".into(),
+            recipients: vec!["to@example.test".into()],
+            cc: Vec::new(),
+            bcc: vec!["hidden@example.test".into()],
+            subject: "Draft subject".into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn local_draft_save_is_immediate_and_updates_one_identity() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let id = {
+            let db = Database::open(path).unwrap();
+            db.upsert_account(&account("one")).unwrap();
+            let created = db.save_draft(&draft_save(None, "offline one"), 10).unwrap();
+            assert_eq!(created.sync_status, DraftSyncStatus::Pending);
+            let updated = db
+                .save_draft(&draft_save(Some(&created.id), "offline two"), 11)
+                .unwrap();
+            assert_eq!(updated.id, created.id);
+            created.id
+        };
+        let db = Database::open(path).unwrap();
+        let drafts = db.list_drafts("one").unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].id, id);
+        assert_eq!(drafts[0].body, "offline two");
+    }
+
+    #[test]
+    fn version_five_migration_adds_draft_storage() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let db = Database::open(path).unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        drop(db);
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch("DROP TABLE drafts; PRAGMA user_version = 5;")
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(path).unwrap();
+        let draft = db.save_draft(&draft_save(None, "migrated"), 10).unwrap();
+        assert_eq!(draft.body, "migrated");
+        assert_eq!(db.list_drafts("one").unwrap(), vec![draft]);
+    }
+
+    #[test]
+    fn remote_advance_preserves_dirty_local_edit_as_conflict() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let created = db.save_draft(&draft_save(None, "version one"), 10).unwrap();
+        let first_remote = RemoteDraft {
+            draft_id: created.id.clone(),
+            revision: 1,
+            uid: 5,
+            recipients: created.recipients.clone(),
+            cc: created.cc.clone(),
+            bcc: created.bcc.clone(),
+            subject: created.subject.clone(),
+            body: created.body.clone(),
+        };
+        db.merge_remote_draft("one", &first_remote, 7, 11).unwrap();
+        db.save_draft(&draft_save(Some(&created.id), "local edit"), 12)
+            .unwrap();
+        let mut advanced = first_remote;
+        advanced.revision = 2;
+        advanced.uid = 6;
+        advanced.body = "remote edit".into();
+        let fork = db.merge_remote_draft("one", &advanced, 7, 13).unwrap();
+
+        assert!(fork.is_some());
+        let drafts = db.list_drafts("one").unwrap();
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts.iter().any(
+            |draft| draft.body == "local edit" && draft.sync_status == DraftSyncStatus::Pending
+        ));
+        assert!(drafts.iter().any(
+            |draft| draft.body == "remote edit" && draft.sync_status == DraftSyncStatus::Synced
+        ));
+    }
+
+    #[test]
+    fn upload_ack_does_not_clear_a_newer_local_save() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let created = db.save_draft(&draft_save(None, "first"), 10).unwrap();
+        let generation = db.draft_sync_records("one").unwrap()[0].local_generation;
+        db.save_draft(&draft_save(Some(&created.id), "raced"), 11)
+            .unwrap();
+        assert!(!db
+            .mark_draft_synced(&created.id, generation, 1, 7, 8)
+            .unwrap());
+        assert_eq!(
+            db.list_drafts("one").unwrap()[0].sync_status,
+            DraftSyncStatus::Pending
+        );
     }
 }

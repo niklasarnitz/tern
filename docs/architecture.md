@@ -6,6 +6,8 @@ Tern is a native Apple mail client with a portable Rust core and SQLite as its c
 
 The first vertical slice imports up to 100 recent Inbox headers over verified implicit TLS, persists them transactionally, and displays the cache in a native macOS list after reopening without network. The CLI handles account configuration and credential prompting during this development slice. The UI is a cache viewer, not yet a complete mail client.
 
+The portable core also supports server-synchronized Tern drafts. Draft saves commit to SQLite immediately through the application API and remain readable offline; explicit synchronization is currently driven by the development CLI credential prompt. Compose UI, platform credential integration, and background scheduling remain future Apple work.
+
 Crate dependencies flow from `mail-core` (application facade and CLI) through `mail-sync` (orchestration) to `mail-imap` (protocol) and `mail-db` (persistence). `mail-mime` normalizes headers through an existing MIME parser. `mail-model` carries the shared records. Add a real `mail-smtp` crate when SMTP is implemented, rather than an empty placeholder.
 
 `mail-autoconfig` owns account discovery. It checks explicit overrides, known provider presets, HTTPS domain autoconfig, RFC 6186 DNS SRV records, and conservative hostname guesses in that order. Discovery probes verified implicit TLS and the IMAP greeting without authenticating. Unsupported STARTTLS discoveries are diagnostic only until the IMAP transport supports negotiated TLS without downgrade.
@@ -31,6 +33,12 @@ Credentials are requested through a Rust `CredentialProvider`. The prototype CLI
 5. Apple apps: shared application models, macOS sidebar/toolbar/menu/shortcuts and platform selection; iPhone navigation and iPad split view. Move blocking FFI reads off the main actor. iOS foreground/manual sync and opportunistic background refresh must tolerate suspension.
 6. Gmail OAuth and iCloud onboarding: browser authorization, Keychain refresh tokens, provider discovery, diagnostics, Gmail label identity. Gmail/iCloud integration tests require authorized test accounts.
 7. Hardening: 10 / 10,000 / 100,000+ messages; slow/offline/changing networks; disconnects; expired tokens; invalid certificates; UIDVALIDITY changes; duplicate IDs; malformed MIME; large attachments; multiple accounts. Measure launch, scrolling, RAM, CPU, DB size, sync time and battery.
+
+## Draft synchronization
+
+Tern-managed drafts carry a stable id and monotonic revision in a private RFC 5322 header. Synchronization discovers the provider's special-use Drafts mailbox, reconciles a complete bounded Tern draft snapshot, and appends a new revision before deleting only the replaced UID. Targeted deletion requires UIDPLUS; Tern refuses broad EXPUNGE rather than risk unrelated messages.
+
+The database retains the last synchronized revision and UID generation. If another device advances the remote revision while the local copy is dirty, both edits are preserved as separate drafts. Divergent copies with the same revision are likewise forked before stale UIDs are cleaned up. Drafts not managed by Tern remain untouched.
 
 Search can follow MVP using FTS5; threading initially remains a flat list. Deferred: Exchange/Graph/JMAP, calendars/contacts, encryption, rules, smart mailboxes, unified inbox, snooze/scheduling, AI, plugins, Linux UI and advanced previews.
 

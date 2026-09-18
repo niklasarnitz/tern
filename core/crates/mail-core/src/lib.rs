@@ -1,9 +1,13 @@
 //! Stable application boundary exposed to native frontends via `UniFFI`.
 use mail_db::Database;
 use mail_model::{
-    Account, AccountDiscovery, DiscoveryOverrides, Mailbox, MessageSummary, WidgetSnapshot,
+    Account, AccountDiscovery, DiscoveryOverrides, Draft, DraftSave, Mailbox, MessageSummary,
+    WidgetSnapshot,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MailError {
@@ -165,6 +169,37 @@ impl MailClient {
             .lock()
             .map_err(storage)?
             .undo_operation(&operation_id)
+            .map_err(storage)
+    }
+
+    /// Save a draft to the canonical local store without performing network I/O.
+    /// The returned draft is immediately available offline and marked pending.
+    ///
+    /// # Errors
+    /// Returns a storage error when the account or draft is invalid or `SQLite`
+    /// cannot commit the save.
+    pub fn save_draft(&self, draft: DraftSave) -> Result<Draft, MailError> {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(storage)?
+            .as_secs();
+        let updated_at = i64::try_from(seconds).map_err(storage)?;
+        self.database
+            .lock()
+            .map_err(storage)?
+            .save_draft(&draft, updated_at)
+            .map_err(storage)
+    }
+
+    /// List locally available drafts without network access.
+    ///
+    /// # Errors
+    /// Returns a storage error if the database cannot be read.
+    pub fn list_drafts(&self, account_id: String) -> Result<Vec<Draft>, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .list_drafts(&account_id)
             .map_err(storage)
     }
 }

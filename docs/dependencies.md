@@ -37,3 +37,5 @@ References:
 Do not infer Gmail/iCloud compatibility from a successful generic protocol build. Live provider verification needs test credentials and Google OAuth setup. SMTP selection is deliberately deferred until the sending slice; evaluate lettre and mail-builder then, including TLS, OAuth and attachment streaming.
 
 The initial protocol tests exposed that async-imap 0.11.3 streaming FETCH/LIST helpers terminate on a tagged response without distinguishing OK from NO. Tern uses `run_command` and `read_response` with the library's parsed response types instead, and rejects failed or incomplete commands before committing a snapshot. It does not retain raw protocol transcripts. Regression tests cover a NO response after 100 fetched headers.
+
+Draft updates use async-imap APPEND, verify the resulting message by Tern's stable draft id, revision, and content, and require UIDPLUS for targeted replacement cleanup. The high-level APPEND API discards APPENDUID, so Tern re-fetches and verifies the appended draft before deleting the prior UID. Broad EXPUNGE is never used.

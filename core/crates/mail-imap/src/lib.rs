@@ -32,7 +32,9 @@ const MAX_IDLE_WAIT: Duration = Duration::from_mins(25);
 const MAX_HEADERS: u32 = 100;
 
 mod conversation;
+mod drafts;
 pub use conversation::{apply_operation, fetch_mailbox};
+pub use drafts::{delete_draft_uids, fetch_drafts, upload_draft};
 
 type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 type ImapSession = Session<TlsStream>;
@@ -70,6 +72,10 @@ pub enum ImapError {
     StaleMailbox,
     #[error("the server does not support safe message moves")]
     MoveUnsupported,
+    #[error("the server does not support safe draft replacement")]
+    DraftUpdateUnsupported,
+    #[error("the Drafts mailbox could not be found")]
+    DraftsMailboxMissing,
 }
 
 impl ImapError {

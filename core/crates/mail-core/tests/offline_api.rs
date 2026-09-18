@@ -5,7 +5,7 @@
 
 use mail_core::MailClient;
 use mail_db::Database;
-use mail_model::{Account, MailboxSnapshot, RemoteHeader};
+use mail_model::{Account, DraftSave, DraftSyncStatus, MailboxSnapshot, RemoteHeader};
 
 #[test]
 fn ffi_api_reopens_a_persisted_snapshot_without_network() {
@@ -97,4 +97,42 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
     assert_eq!(client.list_messages(mailbox_id, 0, 100).unwrap().len(), 100);
     drop(client);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn ffi_draft_save_is_immediately_offline_readable() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mail.sqlite");
+    let path = path.to_str().unwrap();
+    let db = Database::open(path).unwrap();
+    db.upsert_account(&Account {
+        id: "draft-account".into(),
+        email: "draft@example.invalid".into(),
+        display_name: "Draft test".into(),
+        imap_host: "unreachable.invalid".into(),
+        imap_port: 993,
+        username: "draft".into(),
+        credential_ref: "keychain-reference-only".into(),
+    })
+    .unwrap();
+    drop(db);
+
+    let client = MailClient::new(path.into()).unwrap();
+    let saved = client
+        .save_draft(DraftSave {
+            id: None,
+            account_id: "draft-account".into(),
+            recipients: vec!["recipient@example.invalid".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Offline".into(),
+            body: "Saved without a network call".into(),
+        })
+        .unwrap();
+    assert_eq!(saved.sync_status, DraftSyncStatus::Pending);
+    drop(client);
+
+    let reopened = MailClient::new(path.into()).unwrap();
+    let drafts = reopened.list_drafts("draft-account".into()).unwrap();
+    assert_eq!(drafts, vec![saved]);
 }
