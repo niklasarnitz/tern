@@ -78,9 +78,9 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT id, account_id, mailbox_id, remote_name, message_id, uid_validity,
                     remote_uid, action, destination_mailbox_id, destination_remote_name,
-                    retry_count, last_error
+                    retry_count, last_error, state
              FROM pending_operations
-             WHERE account_id = ?1 AND state IN ('pending', 'failed')
+             WHERE account_id = ?1 AND state <> 'completed'
              ORDER BY id",
         )?;
         let rows = statement.query_map([account_id], |row| {
@@ -98,6 +98,7 @@ impl Database {
                 destination_remote_name: row.get(9)?,
                 retry_count: crate::u32_from_sql(row.get::<_, i64>(10)?, 10)?,
                 last_error: row.get(11)?,
+                can_replay: matches!(row.get::<_, String>(12)?.as_str(), "pending" | "failed"),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -149,7 +150,8 @@ fn mutate_one(
 ) -> Result<()> {
     let membership = transaction
         .query_row(
-            "SELECT mb.account_id, mb.remote_name, mm.uid_validity, mm.remote_uid
+            "SELECT mb.account_id, mb.remote_name, mm.uid_validity, mm.remote_uid,
+                    mm.local_only
              FROM mailbox_messages mm
              JOIN mailboxes mb ON mb.id = mm.mailbox_id
              WHERE mm.message_id = ?1 AND mm.mailbox_id = ?2 AND mm.local_only = 0
@@ -161,6 +163,7 @@ fn mutate_one(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)? != 0,
                 ))
             },
         )
@@ -195,18 +198,19 @@ fn mutate_one(
     transaction.execute(
         "INSERT INTO pending_operations
             (account_id, mailbox_id, remote_name, message_id, uid_validity, remote_uid,
-             action, destination_mailbox_id, destination_remote_name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             action, destination_mailbox_id, destination_remote_name, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             membership.0,
             mailbox_id,
             membership.1,
             message_id,
             membership.2,
-            membership.3,
+            if membership.4 { 0 } else { membership.3 },
             action_name,
             destination.as_ref().map(|value| &value.0),
             destination.as_ref().map(|value| &value.1),
+            if membership.4 { "waiting" } else { "pending" },
         ],
     )?;
     match action {
@@ -222,15 +226,6 @@ fn mutate_one(
             let (destination_id, _, destination_validity) =
                 destination.ok_or(DatabaseError::InvalidMoveDestination)?;
             let validity = destination_validity.ok_or(DatabaseError::InvalidMoveDestination)?;
-            let projected_uid = transaction.query_row(
-                "SELECT CASE
-                     WHEN EXISTS(SELECT 1 FROM mailbox_messages
-                                 WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3)
-                     THEN COALESCE(MAX(remote_uid), 0) + 1 ELSE ?3 END
-                 FROM mailbox_messages WHERE mailbox_id = ?1 AND uid_validity = ?2",
-                params![destination_id, validity, membership.3],
-                |row| row.get::<_, i64>(0),
-            )?;
             let flags = transaction.query_row(
                 "SELECT is_read, is_starred FROM mailbox_messages
                  WHERE mailbox_id = ?1 AND message_id = ?2",
@@ -241,20 +236,29 @@ fn mutate_one(
                 "DELETE FROM mailbox_messages WHERE mailbox_id = ?1 AND message_id = ?2",
                 params![mailbox_id, message_id],
             )?;
-            transaction.execute(
-                "INSERT INTO mailbox_messages
+            let destination_has_message = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_messages
+                               WHERE mailbox_id = ?1 AND message_id = ?2)",
+                params![destination_id, message_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )?;
+            if !destination_has_message {
+                let projected_uid = -transaction.last_insert_rowid();
+                transaction.execute(
+                    "INSERT INTO mailbox_messages
                     (mailbox_id, message_id, uid_validity, remote_uid,
                      is_read, is_starred, local_only)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                params![
-                    destination_id,
-                    message_id,
-                    validity,
-                    projected_uid,
-                    flags.0,
-                    flags.1
-                ],
-            )?;
+                    params![
+                        destination_id,
+                        message_id,
+                        validity,
+                        projected_uid,
+                        flags.0,
+                        flags.1
+                    ],
+                )?;
+            }
         }
     }
     Ok(())

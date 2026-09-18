@@ -4,7 +4,7 @@
 //! protocol crates can therefore synchronize into this store without exposing
 //! IMAP concepts to the Swift application.
 
-use std::{ops::Deref, path::Path};
+use std::{collections::HashMap, ops::Deref, path::Path};
 
 use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
@@ -279,7 +279,7 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT msg.id, mm.mailbox_id, mm.remote_uid,
                     msg.subject, msg.sender, msg.date, msg.snippet,
-                    mm.is_read, mm.is_starred, msg.has_attachments
+                    mm.is_read, mm.is_starred, msg.has_attachments, mm.local_only
              FROM mailbox_messages AS mm
              JOIN mailboxes AS mb ON mb.id = mm.mailbox_id
              JOIN messages AS msg ON msg.id = mm.message_id
@@ -292,10 +292,15 @@ impl Database {
         let rows = statement.query_map(
             params![mailbox_id, i64::from(limit), i64::from(offset)],
             |row| {
+                let local_only = row.get::<_, i64>(10)? != 0;
                 Ok(MessageSummary {
                     id: row.get(0)?,
                     mailbox_id: row.get(1)?,
-                    remote_uid: u32_from_sql(row.get::<_, i64>(2)?, 2)?,
+                    remote_uid: if local_only {
+                        0
+                    } else {
+                        u32_from_sql(row.get::<_, i64>(2)?, 2)?
+                    },
                     subject: row.get(3)?,
                     sender: row.get(4)?,
                     date: row.get(5)?,
@@ -405,20 +410,22 @@ fn migrate(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    let mut migration_open = false;
     if version == 1 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
-                 ON mailbox_messages(message_id);
-             PRAGMA user_version = 2;
-             COMMIT;",
+                 ON mailbox_messages(message_id);",
         )?;
         version = 2;
+        migration_open = true;
     }
     if version == 2 {
+        if !migration_open {
+            connection.execute_batch("BEGIN IMMEDIATE;")?;
+        }
         connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE messages ADD COLUMN thread_id TEXT;
+            "ALTER TABLE messages ADD COLUMN thread_id TEXT;
              ALTER TABLE messages ADD COLUMN canonical_message_id TEXT;
              ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '[]';
              ALTER TABLE messages ADD COLUMN cc_json TEXT NOT NULL DEFAULT '[]';
@@ -466,23 +473,59 @@ fn migrate(connection: &Connection) -> Result<()> {
 }
 
 fn backfill_threads(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("SELECT id, account_id FROM messages ORDER BY id")?;
+    let mut statement = connection.prepare(
+        "SELECT id, account_id, message_id_header, subject, sender
+         FROM messages ORDER BY id",
+    )?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    for (message_id, account_id) in rows {
+    let mut canonical_counts = HashMap::new();
+    for (_, account_id, header, _, _) in &rows {
+        if let Some(canonical) = header.as_deref().and_then(canonical_message_id) {
+            *canonical_counts
+                .entry((account_id.clone(), canonical))
+                .or_insert(0_u32) += 1;
+        }
+    }
+    for (message_id, account_id, header, subject, sender) in rows {
         let thread_id = format!("thr:{}:{}", account_id.len(), message_id);
+        let canonical = header.as_deref().and_then(canonical_message_id);
+        let fingerprint = serde_json::to_string(&(
+            &subject,
+            &sender,
+            Option::<i64>::None,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        ))?;
         connection.execute(
             "INSERT INTO threads (id, account_id) VALUES (?1, ?2)",
             params![thread_id, account_id],
         )?;
         connection.execute(
-            "UPDATE messages SET thread_id = ?2 WHERE id = ?1",
-            params![message_id, thread_id],
+            "UPDATE messages
+             SET thread_id = ?2, canonical_message_id = ?3, header_fingerprint = ?4
+             WHERE id = ?1",
+            params![message_id, thread_id, canonical, fingerprint],
         )?;
+        if let Some(canonical) = canonical {
+            if canonical_counts.get(&(account_id.clone(), canonical.clone())) == Some(&1) {
+                connection.execute(
+                    "INSERT INTO thread_keys (account_id, key, thread_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![account_id, message_key(&canonical), thread_id],
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -584,29 +627,56 @@ where
         })
         .transpose()?
         .flatten();
-    let generic_match = if header.provider_message_id.is_none() && content_json.is_some() {
-        canonical_message_id
-            .as_deref()
-            .map(|canonical| {
-                transaction
-                    .query_row(
-                        "SELECT id FROM messages
+    let projected_match = canonical_message_id
+        .as_deref()
+        .map(|canonical| {
+            transaction
+                .query_row(
+                    "SELECT msg.id FROM mailbox_messages mm
+                     JOIN messages msg ON msg.id = mm.message_id
+                     WHERE mm.mailbox_id = ?1 AND mm.local_only = 1
+                       AND msg.canonical_message_id = ?2
+                       AND msg.header_fingerprint = ?3
+                     ORDER BY msg.id LIMIT 1",
+                    params![mailbox_id, canonical, fingerprint],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .transpose()?
+        .flatten();
+    let strong_metadata =
+        !header.sender.is_empty() && !header.date.is_empty() && header.sent_at.is_some();
+    let generic_match =
+        if header.provider_message_id.is_none() && (content_json.is_some() || strong_metadata) {
+            canonical_message_id
+                .as_deref()
+                .map(|canonical| {
+                    transaction
+                        .query_row(
+                            "SELECT id FROM messages
                          WHERE account_id = ?1
                            AND canonical_message_id = ?2
-                           AND header_fingerprint = ?3 AND content_json = ?4
+                           AND header_fingerprint = ?3
+                           AND EXISTS(
+                               SELECT 1 FROM mailbox_messages mm
+                               WHERE mm.message_id = messages.id AND mm.mailbox_id <> ?4
+                           )
+                           AND (?5 IS NULL OR content_json = ?5)
                          ORDER BY id LIMIT 1",
-                        params![account_id, canonical, fingerprint, content_json],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
+                            params![account_id, canonical, fingerprint, mailbox_id, content_json],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
     let message_row_id = membership_message_id
         .or(provider_match)
+        .or(projected_match)
         .or(generic_match)
         .unwrap_or_else(|| message_id(mailbox_id, uid_validity, header.uid));
     let thread_id = resolve_thread(
@@ -673,12 +743,23 @@ where
             fingerprint,
         ],
     )?;
+    transaction.execute(
+        "UPDATE pending_operations
+         SET uid_validity = ?3, remote_uid = ?4, state = 'pending', last_error = NULL
+         WHERE mailbox_id = ?1 AND message_id = ?2 AND state = 'waiting'",
+        params![
+            mailbox_id,
+            message_row_id,
+            i64::from(uid_validity),
+            i64::from(header.uid)
+        ],
+    )?;
     let moved_away = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM pending_operations
              WHERE mailbox_id = ?1 AND message_id = ?2 AND uid_validity = ?3
                AND remote_uid = ?4 AND action = 'move'
-               AND state IN ('pending', 'failed', 'completed')
+               AND state IN ('pending', 'failed', 'waiting', 'completed')
          )",
         params![
             mailbox_id,
@@ -1064,6 +1145,7 @@ fn message_id(mailbox_id: &str, uid_validity: u32, remote_uid: u32) -> String {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use mail_model::{MailAction, MessageContent};
     use tempfile::NamedTempFile;
 
     fn account(id: &str) -> Account {
@@ -1096,6 +1178,24 @@ mod tests {
                     ..RemoteHeader::default()
                 })
                 .collect(),
+        }
+    }
+
+    fn conversation_header(uid: u32, message_id: &str, references: &[&str]) -> RemoteHeader {
+        RemoteHeader {
+            uid,
+            message_id: Some(message_id.into()),
+            references: references.iter().map(|value| (*value).into()).collect(),
+            subject: format!("Conversation {uid}"),
+            sender: format!("sender{uid}@example.test"),
+            date: format!("2026-01-01T00:{uid:02}:00Z"),
+            sent_at: Some(i64::from(uid)),
+            recipients: vec!["reader@example.test".into()],
+            content: Some(MessageContent {
+                plain_text: format!("body {uid}"),
+                ..MessageContent::default()
+            }),
+            ..RemoteHeader::default()
         }
     }
 
@@ -1248,5 +1348,384 @@ mod tests {
             db.list_accounts().unwrap()[0].imap_host,
             "imap.example.test"
         );
+    }
+
+    #[test]
+    fn threads_normal_long_and_branched_replies_without_subject_grouping() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let headers = vec![
+            conversation_header(1, "root@example.test", &[]),
+            conversation_header(2, "<two@example.test>", &["root@example.test"]),
+            conversation_header(
+                3,
+                "<three@example.test>",
+                &["<root@example.test>", "<two@example.test>"],
+            ),
+            conversation_header(4, "branch@example.test", &["<root@example.test>"]),
+            conversation_header(5, "unrelated@example.test", &[]),
+        ];
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(6),
+                    headers,
+                },
+            )
+            .unwrap();
+        let threads = db.list_threads(&mailbox.id, 0, 200).unwrap();
+        assert_eq!(threads.len(), 2);
+        let conversation = threads
+            .iter()
+            .find(|thread| thread.message_count == 4)
+            .unwrap();
+        let messages = db.list_thread_messages(&conversation.id, 0, 200).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Conversation 1",
+                "Conversation 2",
+                "Conversation 3",
+                "Conversation 4"
+            ]
+        );
+    }
+
+    #[test]
+    fn late_missing_parent_joins_phantom_thread_after_reopen() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let db = Database::open(path).unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(3),
+                    headers: vec![conversation_header(
+                        2,
+                        "child@example.test",
+                        &["missing@example.test"],
+                    )],
+                },
+            )
+            .unwrap();
+        drop(db);
+        let db = Database::open(path).unwrap();
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(3),
+                headers: vec![conversation_header(1, "missing@example.test", &[])],
+            },
+        )
+        .unwrap();
+        let threads = db.list_threads(&mailbox.id, 0, 20).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].message_count, 2);
+    }
+
+    #[test]
+    fn malformed_self_and_conflicting_duplicate_ids_do_not_bridge_threads() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut duplicate = conversation_header(2, "dup@example.test", &["<bad"]);
+        duplicate.sender = "attacker@example.test".into();
+        duplicate.content.as_mut().unwrap().plain_text = "different".into();
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(4),
+                    headers: vec![
+                        conversation_header(1, "dup@example.test", &["dup@example.test"]),
+                        duplicate,
+                        conversation_header(3, "other@example.test", &["missing-angle"]),
+                    ],
+                },
+            )
+            .unwrap();
+        let threads = db.list_threads(&mailbox.id, 0, 20).unwrap();
+        assert_eq!(threads.len(), 3);
+    }
+
+    #[test]
+    fn cross_folder_generic_and_gmail_copies_deduplicate_with_local_flags() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let generic = conversation_header(1, "copy@example.test", &[]);
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![generic.clone()],
+                },
+            )
+            .unwrap();
+        let mut archive_copy = generic;
+        archive_copy.uid = 9;
+        archive_copy.is_read = true;
+        let archive = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "Archive".into(),
+                    uid_validity: 7,
+                    uid_next: Some(10),
+                    headers: vec![archive_copy],
+                },
+            )
+            .unwrap();
+        let inbox_message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        let archive_message = db.list_messages(&archive.id, 0, 10).unwrap().remove(0);
+        assert_eq!(inbox_message.id, archive_message.id);
+        let detail = db.get_thread_message(&inbox_message.id).unwrap().unwrap();
+        assert_eq!(detail.memberships.len(), 2);
+        assert!(!detail.memberships[0].is_read || !detail.memberships[1].is_read);
+
+        let mut gmail_one = conversation_header(20, "g1@example.test", &[]);
+        gmail_one.provider_message_id = Some("gm-1".into());
+        gmail_one.provider_thread_id = Some("gt-1".into());
+        let mut gmail_two = conversation_header(21, "g2@example.test", &[]);
+        gmail_two.provider_message_id = Some("gm-2".into());
+        gmail_two.provider_thread_id = Some("gt-1".into());
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(22),
+                headers: vec![gmail_one, gmail_two],
+            },
+        )
+        .unwrap();
+        assert!(db
+            .list_threads(&inbox.id, 0, 20)
+            .unwrap()
+            .iter()
+            .any(|thread| thread.message_count == 2));
+    }
+
+    #[test]
+    fn offline_flags_survive_refresh_and_uid_reset_stales_replay() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut initial = snapshot("INBOX", 1, &[1]);
+        initial.headers[0].is_read = false;
+        let mailbox = db.apply_snapshot("one", &initial).unwrap();
+        let message = db.list_messages(&mailbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &mailbox.id, MailAction::MarkRead, None)
+            .unwrap();
+        db.apply_snapshot("one", &initial).unwrap();
+        assert!(db.list_messages(&mailbox.id, 0, 10).unwrap()[0].is_read);
+        assert_eq!(db.pending_operations("one").unwrap().len(), 1);
+        db.apply_snapshot("one", &snapshot("INBOX", 2, &[1]))
+            .unwrap();
+        let stale = db.pending_operations("one").unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(!stale[0].can_replay);
+        assert!(stale[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("UIDVALIDITY"));
+    }
+
+    #[test]
+    fn move_projects_locally_without_duplicate_and_reconciles_destination_uid() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let original = conversation_header(1, "move@example.test", &[]);
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![original.clone()],
+                },
+            )
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 4, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &inbox.id, MailAction::Move, Some(&archive.id))
+            .unwrap();
+        assert!(db.list_messages(&inbox.id, 0, 10).unwrap().is_empty());
+        assert_eq!(db.list_messages(&archive.id, 0, 10).unwrap().len(), 1);
+        let mut confirmed = original;
+        confirmed.uid = 40;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Archive".into(),
+                uid_validity: 4,
+                uid_next: Some(41),
+                headers: vec![confirmed],
+            },
+        )
+        .unwrap();
+        let messages = db.list_messages(&archive.id, 0, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].remote_uid, 40);
+    }
+
+    #[test]
+    fn failed_operations_persist_retry_details_across_reopen() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let db = Database::open(path).unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mailbox = db
+            .apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+        let message = db.list_messages(&mailbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &mailbox.id, MailAction::Star, None)
+            .unwrap();
+        let operation = db.pending_operations("one").unwrap().remove(0);
+        db.fail_operation(&operation.id, "temporary server failure")
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(path).unwrap();
+        let operation = db.pending_operations("one").unwrap().remove(0);
+        assert!(operation.can_replay);
+        assert_eq!(operation.retry_count, 1);
+        assert_eq!(
+            operation.last_error.as_deref(),
+            Some("temporary server failure")
+        );
+        db.complete_operation(&operation.id).unwrap();
+        assert!(db.pending_operations("one").unwrap().is_empty());
+    }
+
+    #[test]
+    fn body_cache_is_lazy_and_previous_plain_text_is_bounded() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let headers = (1..=25)
+            .map(|uid| {
+                let references = (uid > 1).then_some("root@example.test");
+                let message_id = if uid == 1 {
+                    "root@example.test".to_owned()
+                } else {
+                    format!("{uid}@example.test")
+                };
+                conversation_header(uid, &message_id, references.as_slice())
+            })
+            .collect();
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(26),
+                    headers,
+                },
+            )
+            .unwrap();
+        assert_eq!(db.cached_body_uids(&mailbox.id).unwrap().len(), 25);
+        let thread = db.list_threads(&mailbox.id, 0, 1).unwrap().remove(0);
+        let metadata = db.list_thread_messages(&thread.id, 0, 200).unwrap();
+        assert!(metadata.iter().all(|message| message.content.is_none()));
+        let last = metadata.last().unwrap();
+        assert!(db
+            .get_thread_message(&last.id)
+            .unwrap()
+            .unwrap()
+            .content
+            .is_some());
+        assert_eq!(db.previous_plain_texts(&last.id, 200).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn version_two_migration_preserves_cache_and_links_new_reply() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE accounts (
+                     id TEXT PRIMARY KEY NOT NULL, email TEXT NOT NULL,
+                     display_name TEXT NOT NULL, imap_host TEXT NOT NULL,
+                     imap_port INTEGER NOT NULL, username TEXT NOT NULL,
+                     credential_ref TEXT NOT NULL
+                 );
+                 CREATE TABLE mailboxes (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                     remote_name TEXT NOT NULL, display_name TEXT NOT NULL,
+                     uid_validity INTEGER, uid_next INTEGER,
+                     UNIQUE(account_id, remote_name)
+                 );
+                 CREATE TABLE messages (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                     message_id_header TEXT, subject TEXT NOT NULL, sender TEXT NOT NULL,
+                     date TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '',
+                     has_attachments INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE mailbox_messages (
+                     mailbox_id TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                     uid_validity INTEGER NOT NULL, remote_uid INTEGER NOT NULL,
+                     is_read INTEGER NOT NULL DEFAULT 0,
+                     is_starred INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(mailbox_id, uid_validity, remote_uid)
+                 );
+                 CREATE INDEX mailbox_messages_message_id_idx
+                     ON mailbox_messages(message_id);
+                 INSERT INTO accounts VALUES
+                     ('one', 'one@example.test', 'One', 'imap.example.test', 993,
+                      'one', 'keychain://one');
+                 INSERT INTO mailboxes VALUES
+                     ('mbx:3:one:5:INBOX', 'one', 'INBOX', 'INBOX', 1, 2);
+                 INSERT INTO messages VALUES
+                     ('legacy-parent', 'one', 'parent@example.test', 'Parent',
+                      'sender@example.test', '2026-01-01T00:00:00Z', '', 0);
+                 INSERT INTO mailbox_messages VALUES
+                     ('mbx:3:one:5:INBOX', 'legacy-parent', 1, 1, 0, 0);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(path).unwrap();
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(3),
+                headers: vec![conversation_header(
+                    2,
+                    "reply@example.test",
+                    &["parent@example.test"],
+                )],
+            },
+        )
+        .unwrap();
+        let threads = db.list_threads("mbx:3:one:5:INBOX", 0, 20).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].message_count, 2);
     }
 }
