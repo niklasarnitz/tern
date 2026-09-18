@@ -34,6 +34,33 @@ pub struct MessageSummary {
     pub has_attachments: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AttachmentSummary {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct MessageDetails {
+    pub message_id: Option<String>,
+    pub senders: Vec<String>,
+    pub recipients: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub reply_to: Vec<String>,
+    pub sent_at: Option<i64>,
+    pub in_reply_to: Vec<String>,
+    pub references: Vec<String>,
+    pub list_id: Vec<String>,
+    pub list_post: Vec<String>,
+    pub list_unsubscribe: Vec<String>,
+    pub authentication_results: Vec<String>,
+    pub received_spf: Vec<String>,
+    pub attachments: Vec<AttachmentSummary>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct Attachment {
     pub id: String,
@@ -121,10 +148,18 @@ pub struct RemoteHeader {
     pub references: Vec<String>,
     pub subject: String,
     pub sender: String,
+    pub senders: Vec<String>,
     pub date: String,
     pub recipients: Vec<String>,
     pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub reply_to: Vec<String>,
     pub sent_at: Option<i64>,
+    pub list_id: Vec<String>,
+    pub list_post: Vec<String>,
+    pub list_unsubscribe: Vec<String>,
+    pub authentication_results: Vec<String>,
+    pub received_spf: Vec<String>,
     pub provider_message_id: Option<String>,
     pub provider_thread_id: Option<String>,
     pub content: Option<MessageContent>,

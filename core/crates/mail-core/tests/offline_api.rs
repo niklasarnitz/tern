@@ -38,7 +38,11 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
                             message_id: Some(format!("<{uid}@example.invalid>")),
                             subject: format!("Message {uid}"),
                             sender: "Sender".into(),
+                            senders: vec!["Sender <sender@example.invalid>".into()],
                             date: "2026-09-18".into(),
+                            recipients: vec!["Reader <reader@example.invalid>".into()],
+                            reply_to: vec!["Replies <reply@example.invalid>".into()],
+                            sent_at: Some(1_789_713_000),
                             is_read: uid % 2 == 0,
                             is_starred: false,
                             ..RemoteHeader::default()
@@ -58,6 +62,15 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
     let page = client.list_messages(mailbox_id.clone(), 0, 30).unwrap();
     assert_eq!(page.len(), 30);
     assert_eq!(page[0].remote_uid, 100);
+    let details = client
+        .message_details(page[0].id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        details.recipients,
+        vec!["Reader <reader@example.invalid>"]
+    );
+    assert_eq!(details.reply_to, vec!["Replies <reply@example.invalid>"]);
     let final_page = client.list_messages(mailbox_id, 90, 30).unwrap();
     assert_eq!(final_page.len(), 10);
     drop(client);

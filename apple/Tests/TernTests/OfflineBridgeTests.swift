@@ -18,6 +18,12 @@ final class OfflineBridgeTests: XCTestCase {
             XCTAssertEqual(firstPage.first?.remoteUid, 105)
             XCTAssertEqual(firstPage.first?.subject, "Offline message 105")
             XCTAssertEqual(firstPage.first?.isStarred, true)
+            let messageID = try XCTUnwrap(firstPage.first?.id)
+            let details = try XCTUnwrap(try firstClient.messageDetails(messageId: messageID))
+            XCTAssertEqual(details.recipients, ["Offline reader <reader@example.invalid>"])
+            XCTAssertEqual(details.replyTo, ["Tern replies <reply@example.invalid>"])
+            XCTAssertEqual(details.attachments.first?.filename, "quarterly-report.pdf")
+            XCTAssertEqual(details.attachments.first?.size, 24_576)
             mailboxID = mailbox.id
         }
 
@@ -36,6 +42,9 @@ final class OfflineBridgeTests: XCTestCase {
         XCTAssertNil(store.errorMessage)
         XCTAssertEqual(store.messages.count, 100)
         XCTAssertTrue(store.hasNextMessagePage)
+        store.selectedMessageID = store.messages.first?.id
+        await store.loadSelectedMessageDetails()
+        XCTAssertEqual(store.selectedMessageDetails?.listId, ["Tern Updates <updates.tern.example>"])
         await store.nextMessagePage()
         XCTAssertEqual(store.messages.count, 5)
         XCTAssertEqual(store.messageOffset, 100)

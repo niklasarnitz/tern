@@ -25,6 +25,10 @@ private actor MailCoreActor {
     func listMessages(mailboxID: String, offset: UInt32, limit: UInt32) throws -> [MessageSummary] {
         try client.listMessages(mailboxId: mailboxID, offset: offset, limit: limit)
     }
+
+    func messageDetails(messageID: String) throws -> MessageDetails? {
+        try client.messageDetails(messageId: messageID)
+    }
 }
 
 @MainActor
@@ -32,10 +36,12 @@ final class MailStore: ObservableObject {
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var mailboxes: [Mailbox] = []
     @Published private(set) var messages: [MessageSummary] = []
+    @Published private(set) var selectedMessageDetails: MessageDetails?
     @Published private(set) var isLoading = false
     @Published private(set) var isLoadingAccounts = false
     @Published private(set) var isLoadingMailboxes = false
     @Published private(set) var isLoadingMessages = false
+    @Published private(set) var isLoadingMessageDetails = false
     @Published private(set) var errorMessage: String?
     @Published var selectedAccountID: String?
     @Published var selectedMailboxID: String?
@@ -98,6 +104,8 @@ final class MailStore: ObservableObject {
         requestGeneration &+= 1
         let generation = requestGeneration
         isLoading = true
+        selectedMessageDetails = nil
+        isLoadingMessageDetails = false
         defer {
             if generation == requestGeneration {
                 isLoading = false
@@ -122,6 +130,8 @@ final class MailStore: ObservableObject {
         selectedAccountID = account.id
         selectedMailboxID = nil
         selectedMessageID = nil
+        selectedMessageDetails = nil
+        isLoadingMessageDetails = false
         messageOffset = 0
         hasNextMessagePage = false
         isLoadingAccounts = false
@@ -146,6 +156,8 @@ final class MailStore: ObservableObject {
         }
         selectedMailboxID = mailbox.id
         selectedMessageID = nil
+        selectedMessageDetails = nil
+        isLoadingMessageDetails = false
         messageOffset = 0
         hasNextMessagePage = false
         isLoadingAccounts = false
@@ -184,6 +196,27 @@ final class MailStore: ObservableObject {
         await loadMessages(mailboxID: mailboxID, offset: messageOffset - messagePageSize, using: core)
     }
 
+    func loadSelectedMessageDetails() async {
+        guard let messageID = selectedMessageID, let core else { return }
+        let generation = requestGeneration
+        selectedMessageDetails = nil
+        isLoadingMessageDetails = true
+        defer {
+            if generation == requestGeneration, selectedMessageID == messageID {
+                isLoadingMessageDetails = false
+            }
+        }
+        do {
+            let details = try await core.messageDetails(messageID: messageID)
+            guard generation == requestGeneration, selectedMessageID == messageID else { return }
+            selectedMessageDetails = details
+        } catch {
+            if generation == requestGeneration, selectedMessageID == messageID {
+                errorMessage = Self.message(for: error)
+            }
+        }
+    }
+
     private func loadAccounts() async {
         guard let core else { return }
         let generation = requestGeneration
@@ -198,6 +231,8 @@ final class MailStore: ObservableObject {
                 selectedSidebarItem = nil
                 mailboxes = []
                 messages = []
+                selectedMessageDetails = nil
+                isLoadingMessageDetails = false
                 return
             }
             if selectedAccountID != account.id {
@@ -231,6 +266,8 @@ final class MailStore: ObservableObject {
                 selectedMailboxID = nil
                 selectedSidebarItem = .account(account.id)
                 messages = []
+                selectedMessageDetails = nil
+                isLoadingMessageDetails = false
             }
         } catch {
             if generation == requestGeneration {
@@ -260,6 +297,13 @@ final class MailStore: ObservableObject {
             messages = Array(loadedMessages.prefix(Int(messagePageSize)))
             messageOffset = offset
             hasNextMessagePage = loadedMessages.count > Int(messagePageSize)
+            if let selectedMessageID, messages.contains(where: { $0.id == selectedMessageID }) {
+                await loadSelectedMessageDetails()
+            } else {
+                selectedMessageID = nil
+                selectedMessageDetails = nil
+                isLoadingMessageDetails = false
+            }
         } catch {
             if generation == requestGeneration {
                 errorMessage = Self.message(for: error)

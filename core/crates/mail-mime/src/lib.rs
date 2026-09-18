@@ -41,18 +41,50 @@ fn header_metadata(message: &mail_parser::Message<'_>) -> RemoteHeader {
             .flat_map(|value| header_ids(&value))
             .collect()
     };
+    let senders = message.from().map(format_addresses).unwrap_or_default();
     RemoteHeader {
         message_id: message.message_id().map(ToOwned::to_owned),
         subject: message.subject().unwrap_or_default().to_owned(),
-        sender: message.from().map(format_sender).unwrap_or_default(),
+        sender: senders.first().cloned().unwrap_or_default(),
+        senders,
         date: message.date().map(ToString::to_string).unwrap_or_default(),
         in_reply_to: ids(HeaderName::InReplyTo),
         references: ids(HeaderName::References),
         recipients: message.to().map(format_addresses).unwrap_or_default(),
         cc: message.cc().map(format_addresses).unwrap_or_default(),
+        bcc: message.bcc().map(format_addresses).unwrap_or_default(),
+        reply_to: message
+            .reply_to()
+            .map(format_addresses)
+            .unwrap_or_default(),
         sent_at: message.date().and_then(date_timestamp),
+        list_id: message
+            .list_id()
+            .as_address()
+            .map(format_addresses)
+            .unwrap_or_default(),
+        list_post: message
+            .list_post()
+            .as_address()
+            .map(format_addresses)
+            .unwrap_or_default(),
+        list_unsubscribe: message
+            .list_unsubscribe()
+            .as_address()
+            .map(format_addresses)
+            .unwrap_or_default(),
+        authentication_results: text_headers(message, HeaderName::AuthenticationResults),
+        received_spf: text_headers(message, HeaderName::ReceivedSpf),
         ..Default::default()
     }
+}
+
+fn text_headers(message: &mail_parser::Message<'_>, name: HeaderName<'static>) -> Vec<String> {
+    message
+        .header_values(name)
+        .filter_map(HeaderValue::as_text)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Parse a complete message and normalize its MIME parts.
@@ -91,17 +123,6 @@ fn header_ids(value: &HeaderValue<'_>) -> Vec<String> {
         .iter()
         .map(|s| s.trim_matches(['<', '>']).to_owned())
         .collect()
-}
-fn format_sender(address: &mail_parser::Address<'_>) -> String {
-    match address {
-        mail_parser::Address::List(list) => list.first().map(format_addr).unwrap_or_default(),
-        mail_parser::Address::Group(groups) => groups
-            .iter()
-            .flat_map(|g| g.addresses.iter())
-            .next()
-            .map(format_addr)
-            .unwrap_or_default(),
-    }
 }
 fn format_addresses(addresses: &mail_parser::Address<'_>) -> Vec<String> {
     match addresses {
@@ -329,6 +350,13 @@ mod tests {
             "From: Sender <sender@example.test>\r\n",
             "To: A <a@example.test>, b@example.test\r\n",
             "Cc: C <c@example.test>\r\n",
+            "Bcc: Hidden <hidden@example.test>\r\n",
+            "Reply-To: Replies <reply@example.test>\r\n",
+            "List-ID: Tern Updates <updates.tern.example>\r\n",
+            "List-Post: <mailto:updates@tern.example>\r\n",
+            "List-Unsubscribe: <https://tern.example/unsubscribe>, <mailto:leave@tern.example>\r\n",
+            "Authentication-Results: mx.example; dkim=pass; spf=pass\r\n",
+            "Received-SPF: pass client-ip=192.0.2.1\r\n",
             "Date: Tue, 17 Sep 2026 08:30:00 +0200\r\n\r\n"
         );
         let header = parse_header(9, raw.as_bytes(), true, false);
@@ -339,6 +367,13 @@ mod tests {
         );
         assert_eq!(header.recipients.len(), 2);
         assert_eq!(header.cc, vec!["C <c@example.test>"]);
+        assert_eq!(header.bcc, vec!["Hidden <hidden@example.test>"]);
+        assert_eq!(header.reply_to, vec!["Replies <reply@example.test>"]);
+        assert_eq!(header.list_id, vec!["Tern Updates <updates.tern.example>"]);
+        assert_eq!(header.list_post, vec!["mailto:updates@tern.example"]);
+        assert_eq!(header.list_unsubscribe.len(), 2);
+        assert_eq!(header.authentication_results.len(), 1);
+        assert_eq!(header.received_spf.len(), 1);
         assert!(header.sent_at.is_some());
     }
 

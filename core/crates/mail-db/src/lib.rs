@@ -6,10 +6,13 @@
 
 use std::{ops::Deref, path::Path};
 
-use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
+use mail_model::{
+    Account, AttachmentSummary, Mailbox, MailboxSnapshot, MessageDetails, MessageSummary,
+    RemoteHeader,
+};
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -290,6 +293,61 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }
+
+    /// Read complete cached metadata for one message without network access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read the requested message.
+    pub fn message_details(&self, message_id: &str) -> Result<Option<MessageDetails>> {
+        let base = self
+            .connection
+            .query_row(
+                "SELECT message_id_header, sent_at FROM messages WHERE id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((message_id_header, sent_at)) = base else {
+            return Ok(None);
+        };
+
+        let values = |category| detail_values(&self.connection, message_id, category);
+        let mut statement = self.connection.prepare(
+            "SELECT id, filename, mime_type, size
+             FROM message_attachments
+             WHERE message_id = ?1
+             ORDER BY position",
+        )?;
+        let attachments = statement
+            .query_map([message_id], |row| {
+                Ok(AttachmentSummary {
+                    id: row.get(0)?,
+                    filename: row.get(1)?,
+                    mime_type: row.get(2)?,
+                    size: u64_from_sql(row.get::<_, i64>(3)?, 3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Some(MessageDetails {
+            message_id: message_id_header,
+            senders: values("from")?,
+            recipients: values("to")?,
+            cc: values("cc")?,
+            bcc: values("bcc")?,
+            reply_to: values("reply-to")?,
+            sent_at,
+            in_reply_to: values("in-reply-to")?,
+            references: values("references")?,
+            list_id: values("list-id")?,
+            list_post: values("list-post")?,
+            list_unsubscribe: values("list-unsubscribe")?,
+            authentication_results: values("authentication-results")?,
+            received_spf: values("received-spf")?,
+            attachments,
+        }))
+    }
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -326,6 +384,7 @@ fn migrate(connection: &Connection) -> Result<()> {
                  sender TEXT NOT NULL,
                  date TEXT NOT NULL,
                  snippet TEXT NOT NULL DEFAULT '',
+                 sent_at INTEGER,
                  has_attachments INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE mailbox_messages (
@@ -341,17 +400,59 @@ fn migrate(connection: &Connection) -> Result<()> {
                  ON mailbox_messages(mailbox_id, uid_validity, remote_uid DESC);
              CREATE INDEX messages_account_idx ON messages(account_id);
              CREATE INDEX mailbox_messages_message_id_idx ON mailbox_messages(message_id);
-             PRAGMA user_version = 2;
+             CREATE TABLE message_detail_values (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 category TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY(message_id, category, position)
+             );
+             CREATE TABLE message_attachments (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 position INTEGER NOT NULL,
+                 id TEXT NOT NULL,
+                 filename TEXT NOT NULL,
+                 mime_type TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 PRIMARY KEY(message_id, position)
+             );
+             PRAGMA user_version = 3;
              COMMIT;",
         )?;
-    } else if version == 1 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
-                 ON mailbox_messages(message_id);
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
+    } else {
+        if version == 1 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
+                     ON mailbox_messages(message_id);
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
+        if version <= 2 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE messages ADD COLUMN sent_at INTEGER;
+                 CREATE TABLE message_detail_values (
+                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                     category TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY(message_id, category, position)
+                 );
+                 CREATE TABLE message_attachments (
+                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                     position INTEGER NOT NULL,
+                     id TEXT NOT NULL,
+                     filename TEXT NOT NULL,
+                     mime_type TEXT NOT NULL,
+                     size INTEGER NOT NULL,
+                     PRIMARY KEY(message_id, position)
+                 );
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
     }
     Ok(())
 }
@@ -383,6 +484,24 @@ fn u32_from_sql(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })
+}
+
+fn u64_from_sql(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
+fn detail_values(connection: &Connection, message_id: &str, category: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT value FROM message_detail_values
+         WHERE message_id = ?1 AND category = ?2
+         ORDER BY position",
+    )?;
+    let values = statement.query_map(params![message_id, category], |row| row.get(0))?;
+    values
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)
 }
 
 fn invalidate_mailbox_memberships<T>(transaction: &T, mailbox_id: &str) -> Result<()>
@@ -422,16 +541,23 @@ where
     T: Deref<Target = Connection>,
 {
     let message_row_id = message_id(mailbox_id, uid_validity, header.uid);
+    let has_attachments = header
+        .content
+        .as_ref()
+        .map(|content| i64::from(u8::from(!content.attachments.is_empty())));
     transaction.execute(
         "INSERT INTO messages
-            (id, account_id, message_id_header, subject, sender, date, snippet, has_attachments)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0)
+            (id, account_id, message_id_header, subject, sender, date, snippet, sent_at,
+             has_attachments)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, COALESCE(?8, 0))
          ON CONFLICT(id) DO UPDATE SET
             account_id = excluded.account_id,
             message_id_header = excluded.message_id_header,
             subject = excluded.subject,
             sender = excluded.sender,
-            date = excluded.date",
+            date = excluded.date,
+            sent_at = excluded.sent_at,
+            has_attachments = COALESCE(?8, messages.has_attachments)",
         params![
             message_row_id,
             account_id,
@@ -439,8 +565,65 @@ where
             header.subject,
             header.sender,
             header.date,
+            header.sent_at,
+            has_attachments,
         ],
     )?;
+
+    transaction.execute(
+        "DELETE FROM message_detail_values WHERE message_id = ?1",
+        [&message_row_id],
+    )?;
+    for (category, values) in [
+        ("from", &header.senders),
+        ("to", &header.recipients),
+        ("cc", &header.cc),
+        ("bcc", &header.bcc),
+        ("reply-to", &header.reply_to),
+        ("in-reply-to", &header.in_reply_to),
+        ("references", &header.references),
+        ("list-id", &header.list_id),
+        ("list-post", &header.list_post),
+        ("list-unsubscribe", &header.list_unsubscribe),
+        ("authentication-results", &header.authentication_results),
+        ("received-spf", &header.received_spf),
+    ] {
+        for (position, value) in values.iter().enumerate() {
+            let position =
+                i64::try_from(position).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            transaction.execute(
+                "INSERT INTO message_detail_values (message_id, category, position, value)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![message_row_id, category, position, value],
+            )?;
+        }
+    }
+
+    if let Some(content) = &header.content {
+        transaction.execute(
+            "DELETE FROM message_attachments WHERE message_id = ?1",
+            [&message_row_id],
+        )?;
+        for (position, attachment) in content.attachments.iter().enumerate() {
+            let position =
+                i64::try_from(position).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let size = i64::try_from(attachment.data.len())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            transaction.execute(
+                "INSERT INTO message_attachments
+                    (message_id, position, id, filename, mime_type, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    message_row_id,
+                    position,
+                    attachment.id,
+                    attachment.filename,
+                    attachment.mime_type,
+                    size,
+                ],
+            )?;
+        }
+    }
     transaction.execute(
         "INSERT INTO mailbox_messages
             (mailbox_id, message_id, uid_validity, remote_uid, is_read, is_starred)
@@ -537,6 +720,109 @@ mod tests {
         let messages = db.list_messages(&mailbox.id, 0, 10).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].remote_uid, 2);
+    }
+
+    #[test]
+    fn migrates_existing_cache_without_losing_messages() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     account_id TEXT NOT NULL,
+                     message_id_header TEXT,
+                     subject TEXT NOT NULL,
+                     sender TEXT NOT NULL,
+                     date TEXT NOT NULL,
+                     snippet TEXT NOT NULL DEFAULT '',
+                     has_attachments INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO messages
+                    (id, account_id, message_id_header, subject, sender, date)
+                 VALUES ('old-message', 'old-account', 'old@example.test', 'Old', 'Sender', '2026');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(path).unwrap();
+        let details = db.message_details("old-message").unwrap().unwrap();
+        assert_eq!(details.message_id.as_deref(), Some("old@example.test"));
+        assert!(details.recipients.is_empty());
+        assert!(details.attachments.is_empty());
+    }
+
+    #[test]
+    fn persists_complete_message_details_and_attachment_metadata() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut snapshot = snapshot("INBOX", 1, &[4]);
+        let header = &mut snapshot.headers[0];
+        header.recipients = vec!["To <to@example.test>".into()];
+        header.senders = vec!["First <first@example.test>".into(), "second@example.test".into()];
+        header.cc = vec!["cc@example.test".into()];
+        header.bcc = vec!["bcc@example.test".into()];
+        header.reply_to = vec!["reply@example.test".into()];
+        header.sent_at = Some(1_789_713_000);
+        header.in_reply_to = vec!["parent@example.test".into()];
+        header.references = vec!["root@example.test".into(), "parent@example.test".into()];
+        header.list_id = vec!["Tern <list.tern.example>".into()];
+        header.list_post = vec!["mailto:list@tern.example".into()];
+        header.list_unsubscribe = vec!["https://tern.example/leave".into()];
+        header.authentication_results = vec!["mx.example; dkim=pass".into()];
+        header.received_spf = vec!["pass".into()];
+        header.content = Some(mail_model::MessageContent {
+            attachments: vec![mail_model::Attachment {
+                id: "part-1".into(),
+                filename: "report.pdf".into(),
+                mime_type: "application/pdf".into(),
+                data: vec![1, 2, 3, 4],
+                content_id: None,
+            }],
+            ..mail_model::MessageContent::default()
+        });
+        db.apply_snapshot("one", &snapshot).unwrap();
+
+        let mailbox = db.list_mailboxes("one").unwrap().pop().unwrap();
+        let message = db.list_messages(&mailbox.id, 0, 1).unwrap().pop().unwrap();
+        assert!(message.has_attachments);
+        let details = db.message_details(&message.id).unwrap().unwrap();
+        assert_eq!(details.senders.len(), 2);
+        assert_eq!(details.recipients, vec!["To <to@example.test>"]);
+        assert_eq!(details.reply_to, vec!["reply@example.test"]);
+        assert_eq!(details.references.len(), 2);
+        assert_eq!(details.authentication_results, vec!["mx.example; dkim=pass"]);
+        assert_eq!(details.attachments.len(), 1);
+        assert_eq!(details.attachments[0].filename, "report.pdf");
+        assert_eq!(details.attachments[0].size, 4);
+    }
+
+    #[test]
+    fn header_only_refresh_preserves_cached_attachment_metadata() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut complete = snapshot("INBOX", 1, &[1]);
+        complete.headers[0].content = Some(mail_model::MessageContent {
+            attachments: vec![mail_model::Attachment {
+                id: "part-1".into(),
+                filename: "cached.txt".into(),
+                mime_type: "text/plain".into(),
+                data: b"cached".to_vec(),
+                content_id: None,
+            }],
+            ..mail_model::MessageContent::default()
+        });
+        db.apply_snapshot("one", &complete).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+
+        let mailbox = db.list_mailboxes("one").unwrap().pop().unwrap();
+        let message = db.list_messages(&mailbox.id, 0, 1).unwrap().pop().unwrap();
+        let details = db.message_details(&message.id).unwrap().unwrap();
+        assert!(message.has_attachments);
+        assert_eq!(details.attachments[0].filename, "cached.txt");
     }
 
     #[test]

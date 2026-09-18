@@ -123,7 +123,7 @@ where
         let request_id = timeout(
             OPERATION_TIMEOUT,
             session.run_command(format!(
-                "FETCH {sequence_set} (UID FLAGS INTERNALDATE {provider_fields}BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT FROM TO CC DATE)])"
+                "FETCH {sequence_set} (UID FLAGS INTERNALDATE {provider_fields}BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT FROM TO CC BCC REPLY-TO DATE LIST-ID LIST-POST LIST-UNSUBSCRIBE AUTHENTICATION-RESULTS RECEIVED-SPF)])"
             )),
         )
         .await

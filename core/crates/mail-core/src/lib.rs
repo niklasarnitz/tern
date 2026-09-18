@@ -1,6 +1,6 @@
 //! Stable application boundary exposed to native frontends via `UniFFI`.
 use mail_db::Database;
-use mail_model::{Account, Mailbox, MessageSummary};
+use mail_model::{Account, Mailbox, MessageDetails, MessageSummary};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -70,6 +70,18 @@ impl MailClient {
             .lock()
             .map_err(storage)?
             .list_messages(&mailbox_id, offset, limit)
+            .map_err(storage)
+    }
+
+    /// Read complete cached metadata for a single message.
+    ///
+    /// # Errors
+    /// Returns a storage error if the database cannot be read.
+    pub fn message_details(&self, message_id: String) -> Result<Option<MessageDetails>, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .message_details(&message_id)
             .map_err(storage)
     }
 }

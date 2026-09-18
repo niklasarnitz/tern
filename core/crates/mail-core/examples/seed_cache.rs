@@ -28,15 +28,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             uid_validity: 17,
             uid_next: Some(106),
             headers: (1..=105)
-                .map(|uid| RemoteHeader {
-                    uid,
-                    message_id: Some(format!("<{uid}@example.invalid>")),
-                    subject: format!("Offline message {uid}"),
-                    sender: "Tern fixture <fixture@example.invalid>".into(),
-                    date: "2026-09-18T09:30:00+00:00".into(),
-                    is_read: uid % 2 == 0,
-                    is_starred: uid % 5 == 0,
-                    ..RemoteHeader::default()
+                .map(|uid| {
+                    let mut header = RemoteHeader {
+                        uid,
+                        message_id: Some(format!("{uid}@example.invalid")),
+                        subject: format!("Offline message {uid}"),
+                        sender: "Tern fixture <fixture@example.invalid>".into(),
+                        senders: vec!["Tern fixture <fixture@example.invalid>".into()],
+                        date: "2026-09-18T09:30:00+00:00".into(),
+                        recipients: vec!["Offline reader <reader@example.invalid>".into()],
+                        reply_to: vec!["Tern replies <reply@example.invalid>".into()],
+                        sent_at: Some(1_789_713_000),
+                        list_id: vec!["Tern Updates <updates.tern.example>".into()],
+                        list_post: vec!["mailto:updates@tern.example".into()],
+                        list_unsubscribe: vec!["https://tern.example/unsubscribe".into()],
+                        authentication_results: vec![
+                            "mx.example.invalid; dkim=pass; spf=pass; dmarc=pass".into(),
+                        ],
+                        received_spf: vec!["pass".into()],
+                        is_read: uid % 2 == 0,
+                        is_starred: uid % 5 == 0,
+                        ..RemoteHeader::default()
+                    };
+                    if uid == 105 {
+                        header.content = Some(mail_model::MessageContent {
+                            attachments: vec![mail_model::Attachment {
+                                id: "part-1".into(),
+                                filename: "quarterly-report.pdf".into(),
+                                mime_type: "application/pdf".into(),
+                                content_id: None,
+                                data: vec![0; 24_576],
+                            }],
+                            ..mail_model::MessageContent::default()
+                        });
+                    }
+                    header
                 })
                 .collect(),
         },
