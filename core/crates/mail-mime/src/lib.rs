@@ -153,6 +153,9 @@ fn normalize_content(message: &mail_parser::Message<'_>) -> Result<MessageConten
         .len()
         .checked_add(html.len())
         .ok_or(MimeError::TooLarge)?;
+    if total > MAX_MESSAGE_BYTES {
+        return Err(MimeError::TooLarge);
+    }
     let mut attachments = Vec::new();
     for (index, part) in message.attachments().enumerate() {
         let data = match &part.body {
@@ -212,6 +215,12 @@ fn sanitize_html(html: &str) -> String {
             "code",
             "div",
             "em",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
             "i",
             "img",
             "li",
@@ -287,6 +296,71 @@ pub fn conversation_plain_text(text: &str, previous: &[String]) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_header_retains_thread_metadata() {
+        let raw = concat!(
+            "Message-ID: <new@example.test>\r\n",
+            "In-Reply-To: <old@example.test>\r\n",
+            "References: <root@example.test> <old@example.test>\r\n",
+            "From: Sender <sender@example.test>\r\n",
+            "To: A <a@example.test>, b@example.test\r\n",
+            "Cc: C <c@example.test>\r\n",
+            "Date: Tue, 17 Sep 2026 08:30:00 +0200\r\n\r\n"
+        );
+        let header = parse_header(9, raw.as_bytes(), true, false);
+        assert_eq!(header.in_reply_to, vec!["old@example.test"]);
+        assert_eq!(
+            header.references,
+            vec!["root@example.test", "old@example.test"]
+        );
+        assert_eq!(header.recipients.len(), 2);
+        assert_eq!(header.cc, vec!["C <c@example.test>"]);
+        assert!(header.sent_at.is_some());
+    }
+
+    #[test]
+    fn parse_message_normalizes_alternative_attachments_and_cid() {
+        let raw = concat!(
+            "Message-ID: <m@example.test>\r\nFrom: A <a@example.test>\r\n",
+            "Date: Tue, 17 Sep 2026 08:30:00 +0000\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+            "--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n",
+            "--inner\r\nContent-Type: text/plain\r\n\r\nplain body\r\n",
+            "--inner\r\nContent-Type: text/html\r\n\r\n<h1>hello</h1><script>x</script><img src=\"cid:pic\"><img src=\"https://tracker.test/x\">\r\n",
+            "--inner--\r\n",
+            "--outer\r\nContent-Type: text/plain; name=note.txt\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\nattached text\r\n",
+            "--outer\r\nContent-Type: image/png\r\nContent-ID: <pic>\r\nContent-Disposition: inline; filename=pic.png\r\nContent-Transfer-Encoding: base64\r\n\r\naGk=\r\n",
+            "--outer--\r\n"
+        );
+        let parsed = parse_message(4, raw.as_bytes(), false, true);
+        assert!(parsed.is_ok());
+        let Some(header) = parsed.ok() else { return };
+        let Some(content) = header.content else {
+            return;
+        };
+        assert!(content.plain_text.contains("plain body"));
+        assert!(content.html.contains("<h1>hello</h1>"));
+        assert!(!content.html.contains("script") && !content.html.contains("https://"));
+        assert_eq!(content.attachments.len(), 2);
+        assert_eq!(content.attachments[0].data, b"attached text");
+        assert_eq!(content.attachments[1].content_id.as_deref(), Some("pic"));
+    }
+
+    #[test]
+    fn parse_message_rejects_bad_transfer_and_oversize_input() {
+        let bad = b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!";
+        assert!(matches!(
+            parse_message(1, bad, false, false),
+            Err(MimeError::Encoding)
+        ));
+        let oversized = vec![b'a'; MAX_MESSAGE_BYTES + 1];
+        assert!(matches!(
+            parse_message(1, &oversized, false, false),
+            Err(MimeError::TooLarge)
+        ));
+    }
+
     #[test]
     fn quote_suppression_requires_exact_previous_body() {
         assert_eq!(
@@ -294,6 +368,15 @@ mod tests {
             Some("reply")
         );
         assert!(conversation_plain_text("On Tue wrote:\n> old", &["different".into()]).is_none());
+        assert!(conversation_plain_text("old", &["old".into()]).is_none());
+        assert_eq!(
+            conversation_plain_text("one\n> old\ntwo", &["old".into()]).as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            conversation_plain_text("reply\n> old\n> \n> text", &["old\n\ntext".into()]).as_deref(),
+            Some("reply")
+        );
     }
     #[test]
     fn sanitizes_active_and_remote_html() {
