@@ -1,0 +1,267 @@
+import Combine
+import Foundation
+
+enum SidebarItem: Hashable {
+    case account(String)
+    case mailbox(String)
+}
+
+/// Keeps all calls into the Rust application API off the main actor.
+private actor MailCoreActor {
+    private let client: MailClient
+
+    init(databasePath: String) throws {
+        client = try MailClient(databasePath: databasePath)
+    }
+
+    func listAccounts() throws -> [Account] {
+        try client.listAccounts()
+    }
+
+    func listMailboxes(accountID: String) throws -> [Mailbox] {
+        try client.listMailboxes(accountId: accountID)
+    }
+
+    func listMessages(mailboxID: String, offset: UInt32, limit: UInt32) throws -> [MessageSummary] {
+        try client.listMessages(mailboxId: mailboxID, offset: offset, limit: limit)
+    }
+}
+
+@MainActor
+final class MailStore: ObservableObject {
+    @Published private(set) var accounts: [Account] = []
+    @Published private(set) var mailboxes: [Mailbox] = []
+    @Published private(set) var messages: [MessageSummary] = []
+    @Published private(set) var isLoading = false
+    @Published private(set) var isLoadingAccounts = false
+    @Published private(set) var isLoadingMailboxes = false
+    @Published private(set) var isLoadingMessages = false
+    @Published private(set) var errorMessage: String?
+    @Published var selectedAccountID: String?
+    @Published var selectedMailboxID: String?
+    @Published var selectedMessageID: String?
+    @Published var selectedSidebarItem: SidebarItem?
+
+    private var core: MailCoreActor?
+    private var started = false
+    private var requestGeneration: UInt64 = 0
+    private var ignoredSidebarSelection: SidebarItem?
+
+    let messagePageSize: UInt32 = 100
+    @Published private(set) var messageOffset: UInt32 = 0
+    @Published private(set) var hasNextMessagePage = false
+
+    var canRefresh: Bool {
+        core != nil && !isLoading
+    }
+
+    var selectedMailbox: Mailbox? {
+        mailboxes.first { $0.id == selectedMailboxID }
+    }
+
+    var selectedMessage: MessageSummary? {
+        messages.first { $0.id == selectedMessageID }
+    }
+
+    func start() async {
+        guard !started else { return }
+        started = true
+        isLoading = true
+        defer { isLoading = false }
+        errorMessage = nil
+
+        let path = DatabaseLocation.path()
+        let generation = requestGeneration
+        do {
+            let createdCore = try await Task.detached(priority: .userInitiated) {
+                try MailCoreActor(databasePath: path)
+            }.value
+            guard generation == requestGeneration else { return }
+            core = createdCore
+            await loadAccounts()
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    func retry() async {
+        errorMessage = nil
+        if core == nil {
+            started = false
+            await start()
+        } else {
+            await refresh()
+        }
+    }
+
+    func refresh() async {
+        guard core != nil else { return }
+        isLoading = true
+        errorMessage = nil
+        if let accountID = selectedAccountID, let account = accounts.first(where: { $0.id == accountID }) {
+            await loadMailboxes(for: account)
+        } else {
+            await loadAccounts()
+        }
+        isLoading = false
+    }
+
+    func selectAccount(_ account: Account) async {
+        guard selectedAccountID != account.id || mailboxes.isEmpty else { return }
+        guard !isLoadingMailboxes else { return }
+        requestGeneration &+= 1
+        selectedAccountID = account.id
+        selectedMailboxID = nil
+        selectedMessageID = nil
+        messageOffset = 0
+        hasNextMessagePage = false
+        messages = []
+        setSidebarSelection(.account(account.id))
+        await loadMailboxes(for: account)
+    }
+
+    func selectMailbox(_ mailbox: Mailbox) async {
+        guard selectedMailboxID != mailbox.id || messages.isEmpty else { return }
+        requestGeneration &+= 1
+        selectedMailboxID = mailbox.id
+        selectedMessageID = nil
+        messageOffset = 0
+        hasNextMessagePage = false
+        messages = []
+        setSidebarSelection(.mailbox(mailbox.id))
+        guard let core else { return }
+        await loadMessages(mailboxID: mailbox.id, offset: 0, using: core)
+    }
+
+    func handleSidebarSelection(_ item: SidebarItem?) async {
+        guard let item else { return }
+        if ignoredSidebarSelection == item {
+            ignoredSidebarSelection = nil
+            return
+        }
+        switch item {
+        case let .account(accountID):
+            if let account = accounts.first(where: { $0.id == accountID }) {
+                await selectAccount(account)
+            }
+        case let .mailbox(mailboxID):
+            if let mailbox = mailboxes.first(where: { $0.id == mailboxID }) {
+                await selectMailbox(mailbox)
+            }
+        }
+    }
+
+    func nextMessagePage() async {
+        guard !isLoadingMessages, hasNextMessagePage,
+              let mailboxID = selectedMailboxID, let core,
+              messageOffset <= UInt32.max - messagePageSize else { return }
+        await loadMessages(mailboxID: mailboxID, offset: messageOffset + messagePageSize, using: core)
+    }
+
+    func previousMessagePage() async {
+        guard !isLoadingMessages, messageOffset > 0,
+              let mailboxID = selectedMailboxID, let core else { return }
+        await loadMessages(mailboxID: mailboxID, offset: messageOffset - messagePageSize, using: core)
+    }
+
+    private func loadAccounts() async {
+        guard let core else { return }
+        let generation = requestGeneration
+        isLoadingAccounts = true
+        defer { isLoadingAccounts = false }
+        do {
+            let loadedAccounts = try await core.listAccounts()
+            guard generation == requestGeneration else { return }
+            accounts = loadedAccounts
+            guard let account = accounts.first(where: { $0.id == selectedAccountID }) ?? accounts.first else {
+                selectedAccountID = nil
+                selectedSidebarItem = nil
+                mailboxes = []
+                messages = []
+                return
+            }
+            if selectedAccountID == nil || mailboxes.isEmpty {
+                await selectAccount(account)
+            } else {
+                await loadMailboxes(for: account)
+            }
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    private func loadMailboxes(for account: Account) async {
+        guard let core else { return }
+        let generation = requestGeneration
+        isLoadingMailboxes = true
+        defer { isLoadingMailboxes = false }
+        do {
+            let loadedMailboxes = try await core.listMailboxes(accountID: account.id)
+            guard generation == requestGeneration, selectedAccountID == account.id else { return }
+            mailboxes = loadedMailboxes
+            if let selectedMailboxID, let selected = mailboxes.first(where: { $0.id == selectedMailboxID }) {
+                setSidebarSelection(.mailbox(selected.id))
+                await loadMessages(mailboxID: selected.id, offset: messageOffset, using: core)
+            } else if let first = mailboxes.first {
+                await selectMailbox(first)
+            } else {
+                selectedMailboxID = nil
+                selectedSidebarItem = .account(account.id)
+                messages = []
+            }
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    private func loadMessages(mailboxID: String, offset: UInt32, using core: MailCoreActor) async {
+        let generation = requestGeneration
+        isLoadingMessages = true
+        defer { isLoadingMessages = false }
+        do {
+            // Every request is deliberately bounded. Paging replaces the
+            // current window rather than accumulating an entire mailbox.
+            let loadedMessages = try await core.listMessages(
+                mailboxID: mailboxID,
+                offset: offset,
+                limit: messagePageSize
+            )
+            guard generation == requestGeneration, selectedMailboxID == mailboxID else { return }
+            messages = loadedMessages
+            messageOffset = offset
+            hasNextMessagePage = loadedMessages.count == Int(messagePageSize)
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    private func setSidebarSelection(_ item: SidebarItem) {
+        guard selectedSidebarItem != item else { return }
+        ignoredSidebarSelection = item
+        selectedSidebarItem = item
+    }
+
+    private static func message(for error: Error) -> String {
+        let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return description.isEmpty ? "The local mail store could not be opened." : description
+    }
+}
+
+private enum DatabaseLocation {
+    static func path() -> String {
+        if let configured = ProcessInfo.processInfo.environment["TERN_DATABASE"] {
+            let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return configured
+            }
+        }
+
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let directory = applicationSupport.appendingPathComponent("Tern", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("mail.sqlite").path
+    }
+}
