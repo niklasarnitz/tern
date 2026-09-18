@@ -111,6 +111,7 @@ pub struct PendingOperation {
     pub destination_remote_name: Option<String>,
     pub retry_count: u32,
     pub last_error: Option<String>,
+    pub can_replay: bool,
 }
 
 #[derive(Clone, Debug, Default)]
