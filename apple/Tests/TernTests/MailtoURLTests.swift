@@ -4,12 +4,10 @@ import XCTest
 
 final class MailtoURLTests: XCTestCase {
     func testParsesRecipientsHeadersUnicodeAndBodyWithoutTreatingPlusAsSpace() throws {
-        let urlString = [
-            "mailto:first@example.com,second@example.com",
-            "?to=third@example.com&cc=copy1@example.com,copy2@example.com",
-            "&BCC=blind@example.com&subject=Status%20%26%20caf%C3%A9",
-            "&body=First+line%0D%0ASecond%20line",
-        ].joined()
+        let urlString = "mailto:first@example.com,second@example.com"
+            + "?to=third@example.com&cc=copy1@example.com,copy2@example.com"
+            + "&BCC=blind@example.com&subject=Status%20%26%20caf%C3%A9"
+            + "&body=First+line%0D%0ASecond%20line"
         let url = try XCTUnwrap(URL(string: urlString))
 
         let draft = try XCTUnwrap(MailtoURLParser.parse(url))
@@ -31,29 +29,22 @@ final class MailtoURLTests: XCTestCase {
     }
 
     func testParsesOnlyLocalFileAttachments() throws {
-        let urlString = [
-            "mailto:user@example.com",
-            "?attach=file%3A%2F%2F%2FUsers%2Fme%2FQuarterly%2520Report.pdf",
-            "&attachment=%2FUsers%2Fme%2Fnotes.txt",
-            "&attach=https%3A%2F%2Fexample.com%2Ftracking.gif",
-            "&attach=file%3A%2F%2Fserver.example.com%2Fshared%2Fsecret.txt",
-        ].joined()
+        let urlString = "mailto:user@example.com"
+            + "?attach=file%3A%2F%2F%2FUsers%2Fme%2FQuarterly%2520Report.pdf"
+            + "&attachment=%2FUsers%2Fme%2Fnotes.txt"
+            + "&attach=https%3A%2F%2Fexample.com%2Ftracking.gif"
+            + "&attach=file%3A%2F%2Fserver.example.com%2Fshared%2Fsecret.txt"
         let url = try XCTUnwrap(URL(string: urlString))
 
         let draft = try XCTUnwrap(MailtoURLParser.parse(url))
 
-        XCTAssertEqual(draft.attachments.map(\.path), [
-            "/Users/me/Quarterly Report.pdf",
-            "/Users/me/notes.txt",
-        ])
+        XCTAssertEqual(draft.attachments.map(\.path), ["/Users/me/Quarterly Report.pdf", "/Users/me/notes.txt"])
     }
 
     func testIgnoresUnsupportedHeadersAndKeepsFirstSubjectAndBody() throws {
-        let urlString = [
-            "mailto:user@example.com",
-            "?subject=First&subject=Second&body=Original",
-            "&body=Replacement&from=attacker@example.com",
-        ].joined()
+        let urlString = "mailto:user@example.com"
+            + "?subject=First&subject=Second&body=Original"
+            + "&body=Replacement&from=attacker@example.com"
         let url = try XCTUnwrap(URL(string: urlString))
 
         let draft = try XCTUnwrap(MailtoURLParser.parse(url))

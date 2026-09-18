@@ -9,8 +9,8 @@ struct ComposeDraft: Identifiable {
     var body: String
     var attachments: [URL]
 
-    static var empty: ComposeDraft {
-        ComposeDraft(
+    static var empty: Self {
+        Self(
             recipients: [],
             carbonCopyRecipients: [],
             blindCarbonCopyRecipients: [],
@@ -53,28 +53,48 @@ enum MailtoURLParser {
             let parts = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             guard let name = decode(parts[0])?.lowercased() else { return false }
             let rawValue = parts.count == 2 ? parts[1] : Substring()
-
-            switch name {
-            case "to", "cc", "bcc":
-                guard let recipients = decodeRecipients(rawValue) else { return false }
-                append(recipients, for: name, to: &draft)
-            case "subject" where !hasSubject:
-                guard let value = decode(rawValue) else { return false }
-                draft.subject = value
-                hasSubject = true
-            case "body" where !hasBody:
-                guard let value = decode(rawValue) else { return false }
-                draft.body = value
-                hasBody = true
-            case "attach", "attachment":
-                guard let value = decode(rawValue) else { return false }
-                if let attachment = localAttachment(from: value) {
-                    draft.attachments.append(attachment)
-                }
-            default:
-                continue
-            }
+            guard parseHeader(
+                name: name,
+                rawValue: rawValue,
+                draft: &draft,
+                hasSubject: &hasSubject,
+                hasBody: &hasBody
+            ) else { return false }
         }
+        return true
+    }
+
+    private static func parseHeader(
+        name: String,
+        rawValue: Substring,
+        draft: inout ComposeDraft,
+        hasSubject: inout Bool,
+        hasBody: inout Bool
+    ) -> Bool {
+        switch name {
+        case "to", "cc", "bcc":
+            guard let recipients = decodeRecipients(rawValue) else { return false }
+            append(recipients, for: name, to: &draft)
+        case "subject":
+            return decodeFirst(rawValue, into: &draft.subject, isSet: &hasSubject)
+        case "body":
+            return decodeFirst(rawValue, into: &draft.body, isSet: &hasBody)
+        case "attach", "attachment":
+            guard let value = decode(rawValue) else { return false }
+            if let attachment = localAttachment(from: value) {
+                draft.attachments.append(attachment)
+            }
+        default:
+            break
+        }
+        return true
+    }
+
+    private static func decodeFirst(_ rawValue: Substring, into value: inout String, isSet: inout Bool) -> Bool {
+        guard !isSet else { return true }
+        guard let decoded = decode(rawValue) else { return false }
+        value = decoded
+        isSet = true
         return true
     }
 
