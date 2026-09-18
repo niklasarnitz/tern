@@ -47,7 +47,7 @@ struct SenderIdentity: Equatable {
         guard let claim = claimedDomains.first(where: { !relatedDomains($0, actualDomain) }) else {
             return nil
         }
-        return "The sender name claims \(claim), but the message came from \(actualDomain)."
+        return "The sender name claims \(claim), but the From address uses \(actualDomain)."
     }
 
     private static func domainClaims(in value: String) -> [String] {
