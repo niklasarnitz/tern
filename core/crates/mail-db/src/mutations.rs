@@ -111,12 +111,137 @@ impl Database {
     /// Returns an error when the operation is absent or `SQLite` rejects the update.
     pub fn complete_operation(&self, id: &str) -> Result<()> {
         let changed = self.connection.execute(
-            "UPDATE pending_operations SET state = 'completed', last_error = NULL WHERE id = ?1",
+            "UPDATE pending_operations
+             SET state = CASE WHEN action = 'move' THEN 'waiting_confirmation'
+                              ELSE 'completed' END,
+                 last_error = CASE
+                     WHEN action = 'move'
+                     THEN 'remote move acknowledged without a destination UID mapping'
+                     ELSE NULL END
+             WHERE id = ?1",
             [id],
         )?;
         if changed == 0 {
             return Err(DatabaseError::PendingOperationNotFound(id.to_owned()));
         }
+        Ok(())
+    }
+
+    /// Acknowledges an atomic remote move and binds its authoritative destination UID.
+    ///
+    /// When the cached destination generation changed or its UID belongs to a
+    /// different message, the operation becomes stale and remains visible for
+    /// safe reconciliation.
+    ///
+    /// # Errors
+    /// Returns an error for a zero remote identity, a missing operation, a
+    /// non-move operation, or a failed transaction.
+    pub fn complete_move_operation(
+        &self,
+        id: &str,
+        destination_uid_validity: u32,
+        destination_uid: u32,
+    ) -> Result<()> {
+        validate_move_completion(destination_uid_validity, destination_uid)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let operation = transaction
+            .query_row(
+                "SELECT account_id, message_id, action, destination_mailbox_id
+                 FROM pending_operations WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| DatabaseError::PendingOperationNotFound(id.to_owned()))?;
+        if operation.2 != "move" {
+            return Err(DatabaseError::PendingOperationNotMove(id.to_owned()));
+        }
+        let destination_mailbox_id = operation.3.ok_or(DatabaseError::InvalidMoveDestination)?;
+        let cached_validity = transaction
+            .query_row(
+                "SELECT uid_validity FROM mailboxes
+                 WHERE id = ?1 AND account_id = ?2",
+                params![destination_mailbox_id, operation.0],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        if cached_validity != Some(i64::from(destination_uid_validity)) {
+            mark_move_stale(
+                &transaction,
+                id,
+                "destination UIDVALIDITY changed after the remote move",
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let uid_owner = transaction
+            .query_row(
+                "SELECT message_id FROM mailbox_messages
+                 WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3",
+                params![
+                    destination_mailbox_id,
+                    i64::from(destination_uid_validity),
+                    i64::from(destination_uid)
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if uid_owner
+            .as_deref()
+            .is_some_and(|message_id| message_id != operation.1)
+        {
+            mark_move_stale(
+                &transaction,
+                id,
+                "destination UID is already assigned to another cached message",
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        if uid_owner.is_some() {
+            transaction.execute(
+                "DELETE FROM mailbox_messages
+                 WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
+                params![destination_mailbox_id, operation.1],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE mailbox_messages
+                 SET uid_validity = ?3, remote_uid = ?4, local_only = 0
+                 WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
+                params![
+                    destination_mailbox_id,
+                    operation.1,
+                    i64::from(destination_uid_validity),
+                    i64::from(destination_uid)
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE pending_operations
+             SET uid_validity = ?3, remote_uid = ?4, state = 'pending', last_error = NULL
+             WHERE mailbox_id = ?1 AND message_id = ?2 AND state = 'waiting'",
+            params![
+                destination_mailbox_id,
+                operation.1,
+                i64::from(destination_uid_validity),
+                i64::from(destination_uid)
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE pending_operations SET state = 'completed', last_error = NULL WHERE id = ?1",
+            [id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -260,6 +385,21 @@ fn mutate_one(
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+fn mark_move_stale(transaction: &Transaction<'_>, id: &str, reason: &str) -> Result<()> {
+    transaction.execute(
+        "UPDATE pending_operations SET state = 'stale', last_error = ?2 WHERE id = ?1",
+        params![id, reason],
+    )?;
+    Ok(())
+}
+
+fn validate_move_completion(uid_validity: u32, uid: u32) -> Result<()> {
+    if uid_validity == 0 || uid == 0 {
+        return Err(DatabaseError::InvalidMoveCompletion);
     }
     Ok(())
 }

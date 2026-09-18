@@ -41,6 +41,10 @@ pub enum DatabaseError {
     InvalidMoveDestination,
     #[error("pending operation {0} does not exist")]
     PendingOperationNotFound(String),
+    #[error("pending operation {0} is not a move")]
+    PendingOperationNotMove(String),
+    #[error("move completion requires nonzero UIDVALIDITY and destination UID")]
+    InvalidMoveCompletion,
     #[error("mail data could not be serialized: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -603,10 +607,22 @@ where
         &header.recipients,
         &header.cc,
     ))?;
+    let strong_metadata =
+        !header.sender.is_empty() && !header.date.is_empty() && header.sent_at.is_some();
     let membership_message_id = transaction
         .query_row(
             "SELECT message_id FROM mailbox_messages
              WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3",
+            params![mailbox_id, i64::from(uid_validity), i64::from(header.uid)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let operation_message_id = transaction
+        .query_row(
+            "SELECT message_id FROM pending_operations
+             WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3
+               AND state <> 'stale'
+             ORDER BY id DESC LIMIT 1",
             params![mailbox_id, i64::from(uid_validity), i64::from(header.uid)],
             |row| row.get::<_, String>(0),
         )
@@ -663,8 +679,37 @@ where
         })
         .transpose()?
         .flatten();
-    let strong_metadata =
-        !header.sender.is_empty() && !header.date.is_empty() && header.sent_at.is_some();
+    let content_projection_match = if canonical_message_id.is_none()
+        && header.provider_message_id.is_none()
+        && content_json.is_some()
+        && strong_metadata
+    {
+        let mut statement = transaction.prepare(
+            "SELECT msg.id FROM messages msg
+             WHERE msg.account_id = ?1 AND msg.header_fingerprint = ?2
+               AND msg.content_json = ?3
+               AND (EXISTS(
+                       SELECT 1 FROM mailbox_messages mm
+                       WHERE mm.message_id = msg.id AND mm.mailbox_id = ?4
+                         AND mm.local_only = 1
+                    ) OR EXISTS(
+                       SELECT 1 FROM pending_operations op
+                       WHERE op.message_id = msg.id
+                         AND (op.mailbox_id = ?4 OR op.destination_mailbox_id = ?4)
+                         AND op.state IN ('waiting', 'waiting_confirmation')
+                    ))
+             ORDER BY msg.id LIMIT 2",
+        )?;
+        let candidates = statement
+            .query_map(
+                params![account_id, fingerprint, content_json, mailbox_id],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        (candidates.len() == 1).then(|| candidates[0].clone())
+    } else {
+        None
+    };
     let generic_match =
         if header.provider_message_id.is_none() && (content_json.is_some() || strong_metadata) {
             canonical_message_id
@@ -693,9 +738,11 @@ where
             None
         };
     let message_row_id = membership_message_id
+        .or(operation_message_id)
         .or(provider_match)
         .or(projected_match)
         .or(queued_match)
+        .or(content_projection_match)
         .or(generic_match)
         .unwrap_or_else(|| message_id(mailbox_id, uid_validity, header.uid));
     let thread_id = resolve_thread(
@@ -774,12 +821,20 @@ where
             i64::from(header.uid)
         ],
     )?;
+    transaction.execute(
+        "UPDATE pending_operations SET state = 'completed', last_error = NULL
+         WHERE action = 'move' AND destination_mailbox_id = ?1 AND message_id = ?2
+           AND state = 'waiting_confirmation'",
+        params![mailbox_id, message_row_id],
+    )?;
     let moved_away = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM pending_operations
              WHERE mailbox_id = ?1 AND message_id = ?2 AND uid_validity = ?3
                AND remote_uid = ?4 AND action = 'move'
-               AND state IN ('pending', 'failed', 'waiting', 'completed')
+               AND state IN (
+                   'pending', 'failed', 'waiting', 'waiting_confirmation', 'stale', 'completed'
+               )
          )",
         params![
             mailbox_id,
@@ -1766,6 +1821,187 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].remote_uid, 30);
         assert!(messages[0].is_read);
+    }
+
+    #[test]
+    fn copyuid_reconciles_missing_message_id_through_flag_and_second_move() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut original = conversation_header(1, "temporary@example.test", &[]);
+        original.message_id = None;
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![original.clone()],
+                },
+            )
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 2, &[]))
+            .unwrap();
+        let trash = db
+            .apply_snapshot("one", &snapshot("Trash", 3, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &inbox.id, MailAction::Move, Some(&archive.id))
+            .unwrap();
+        db.mutate_message(&message.id, &archive.id, MailAction::MarkRead, None)
+            .unwrap();
+        db.mutate_message(&message.id, &archive.id, MailAction::Move, Some(&trash.id))
+            .unwrap();
+        let first_move = db
+            .pending_operations("one")
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.action == MailAction::Move && operation.can_replay)
+            .unwrap();
+        db.complete_move_operation(&first_move.id, 2, 20).unwrap();
+        let rebound = db.pending_operations("one").unwrap();
+        assert_eq!(rebound.len(), 2);
+        assert!(rebound.iter().all(|operation| operation.can_replay));
+        let flag = rebound
+            .iter()
+            .find(|operation| operation.action == MailAction::MarkRead)
+            .unwrap();
+        db.complete_operation(&flag.id).unwrap();
+        let second_move = db
+            .pending_operations("one")
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.action == MailAction::Move)
+            .unwrap();
+        db.complete_move_operation(&second_move.id, 3, 30).unwrap();
+        assert!(db.pending_operations("one").unwrap().is_empty());
+
+        let mut archive_remote = original.clone();
+        archive_remote.uid = 20;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Archive".into(),
+                uid_validity: 2,
+                uid_next: Some(21),
+                headers: vec![archive_remote],
+            },
+        )
+        .unwrap();
+        assert!(db.list_messages(&archive.id, 0, 10).unwrap().is_empty());
+        let mut trash_remote = original;
+        trash_remote.uid = 30;
+        trash_remote.is_read = true;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Trash".into(),
+                uid_validity: 3,
+                uid_next: Some(31),
+                headers: vec![trash_remote],
+            },
+        )
+        .unwrap();
+        let trash_messages = db.list_messages(&trash.id, 0, 10).unwrap();
+        assert_eq!(trash_messages.len(), 1);
+        assert_eq!(trash_messages[0].id, message.id);
+        assert_eq!(trash_messages[0].remote_uid, 30);
+        assert!(trash_messages[0].is_read);
+    }
+
+    #[test]
+    fn copyuid_completion_rejects_invalid_or_nonmove_operations() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mailbox = db
+            .apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+        let message = db.list_messages(&mailbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &mailbox.id, MailAction::Star, None)
+            .unwrap();
+        let operation = db.pending_operations("one").unwrap().remove(0);
+        assert!(matches!(
+            db.complete_move_operation(&operation.id, 0, 1),
+            Err(DatabaseError::InvalidMoveCompletion)
+        ));
+        assert!(matches!(
+            db.complete_move_operation(&operation.id, 1, 1),
+            Err(DatabaseError::PendingOperationNotMove(_))
+        ));
+    }
+
+    #[test]
+    fn copyuid_generation_mismatch_becomes_visible_stale_evidence() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let inbox = db
+            .apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 2, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &inbox.id, MailAction::Move, Some(&archive.id))
+            .unwrap();
+        let operation = db.pending_operations("one").unwrap().remove(0);
+        db.complete_move_operation(&operation.id, 99, 7).unwrap();
+        let stale = db.pending_operations("one").unwrap().remove(0);
+        assert!(!stale.can_replay);
+        assert!(stale.last_error.as_deref().unwrap().contains("UIDVALIDITY"));
+        assert_eq!(db.list_messages(&archive.id, 0, 10).unwrap().len(), 1);
+        assert_eq!(
+            db.list_messages(&archive.id, 0, 10).unwrap()[0].remote_uid,
+            0
+        );
+    }
+
+    #[test]
+    fn full_body_safely_confirms_canonical_less_move_without_copyuid() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut original = conversation_header(1, "unused@example.test", &[]);
+        original.message_id = None;
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![original.clone()],
+                },
+            )
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 2, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &inbox.id, MailAction::Move, Some(&archive.id))
+            .unwrap();
+        let operation = db.pending_operations("one").unwrap().remove(0);
+        db.complete_operation(&operation.id).unwrap();
+        let awaiting = db.pending_operations("one").unwrap().remove(0);
+        assert!(!awaiting.can_replay);
+        assert!(awaiting.last_error.as_deref().unwrap().contains("without"));
+
+        let mut confirmed = original;
+        confirmed.uid = 40;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Archive".into(),
+                uid_validity: 2,
+                uid_next: Some(41),
+                headers: vec![confirmed],
+            },
+        )
+        .unwrap();
+        assert!(db.pending_operations("one").unwrap().is_empty());
+        let messages = db.list_messages(&archive.id, 0, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message.id);
+        assert_eq!(messages[0].remote_uid, 40);
     }
 
     #[test]
