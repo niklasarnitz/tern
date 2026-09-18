@@ -2,9 +2,9 @@
 
 ## Scope
 
-`mail-imap` owns the first slice's read-only IMAP boundary: verified implicit
-TLS, authenticated Inbox header snapshots, and selectable remote mailbox names.
-It converts protocol data into `mail-model` snapshots through `mail-mime`.
+`mail-imap` owns the verified implicit-TLS IMAP boundary: authenticated mailbox
+snapshots, bounded header/body fetches, and remote mailbox operations. It
+converts protocol data into `mail-model` records through `mail-mime`.
 Inherit shared repository guidance from [`../../../AGENTS.md`](../../../AGENTS.md);
 dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependencies.md).
 
@@ -13,7 +13,8 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 - Use the platform certificate roots and implicit TLS. The current slice has no
   STARTTLS downgrade path, certificate override, or Gmail password login;
   Gmail requires the future OAuth path.
-- `EXAMINE` and `BODY.PEEK` keep sync read-only. Keep bounded recent header and
+- `EXAMINE` and `BODY.PEEK` keep reads read-only. `UIDSTORE` and `MOVE` execute
+  remote mutations only through the sync operation path. Keep bounded recent header and
   body fetches, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and
   timeout behavior intact. Body fetches must honor the MIME byte budget before
   handing data to normalization.

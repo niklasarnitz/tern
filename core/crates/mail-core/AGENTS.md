@@ -3,7 +3,7 @@
 ## Scope
 
 `mail-core` is the stable application facade exposed to Apple through UniFFI.
-The current `MailClient` opens the canonical local store and offers read-only
+The current `MailClient` opens the canonical local store and offers offline
 account, mailbox, bounded message-list, conversation, and pending-operation
 queries. Message bodies and attachments are loaded through the selected detail
 path, while list APIs remain metadata-only. The CLI is the development owner
@@ -21,8 +21,10 @@ of account configuration and sync. Inherit shared guidance from
 - The CLI may prompt for a password without echo and invoke `mail-sync`; JSON
   account configuration stores a credential reference only. Apple onboarding
   must later supply Keychain-backed credentials.
-- The first slice is not a complete mail client. Compose, SMTP, actions,
-  incremental sync, OAuth onboarding, and background refresh are future work.
+- The first slice is not a complete mail client. Compose, SMTP, incremental
+  sync, OAuth onboarding, and background refresh are future work. Per-membership
+  mark/read, star, and move operations are exposed through the offline facade;
+  remote replay remains the sync layer's responsibility.
 
 ## Coordination
 
