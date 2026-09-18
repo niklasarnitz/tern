@@ -2,8 +2,8 @@
 
 ## Scope
 
-`mail-mime` normalizes fetched RFC 5322 headers into `mail-model::RemoteHeader`.
-The current boundary is header metadata only; database and UI layers should not
+`mail-mime` normalizes fetched RFC 5322 messages into `mail-model::RemoteHeader`
+and bounded `MessageContent` records. The database and UI layers should not
 depend on `mail-parser` types. Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
@@ -16,8 +16,15 @@ depend on `mail-parser` types. Inherit shared guidance from [`../../../AGENTS.md
   callers may replace the parsed Date accordingly.
 - Keep this crate free of mailbox identity and persistence policy. Message-ID
   remains metadata; `mail-db` owns local identity and membership state.
-- Body parts, HTML sanitization, attachments, MIME construction, and SMTP are
-  future slices. Do not widen this parser implicitly while changing headers.
+- Normalize plain text, sanitized HTML, inline CID resources, binary/text
+  attachments, and forwarded `message/rfc822` parts through `mail-parser`.
+  Reject malformed transfer decoding and enforce the total decoded byte budget.
+  Sanitized HTML removes active content and remote/relative image sources while
+  preserving safe hyperlinks. Any web view remains responsible for locking
+  navigation and network access.
+- `conversation_plain_text` may remove only contiguous quote blocks whose
+  unquoted lines exactly match a prior stored body. Preserve originals and use
+  the result as a reversible display projection; leave HTML unchanged.
 
 ## Coordination
 

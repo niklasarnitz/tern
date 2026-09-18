@@ -2,8 +2,10 @@
 
 ## Scope
 
-`mail-db` is the canonical SQLite store for account configuration, mailboxes, message summaries, and mailbox membership. It maps `mail-model` records to
-schema rows and exposes bounded offline reads plus transactional snapshots.
+`mail-db` is the canonical SQLite store for account configuration, mailboxes,
+messages, conversations, pending operations, and per-mailbox membership. It
+maps `mail-model` records to schema rows and exposes bounded offline reads plus
+transactional snapshots.
 Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
@@ -13,6 +15,13 @@ Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
 - A message row and its mailbox membership are distinct. Read/star flags belong
   to `mailbox_messages`, so the same message can have different flags per
   mailbox.
+- Conversation identity uses normalized RFC threading metadata and provider
+  keys as scoped aliases; conflicting duplicate Message-IDs remain separate.
+  Cross-folder identity must preserve one message row with multiple
+  memberships when the evidence is strong enough.
+- Conversation list reads return metadata. Decode persisted bodies and
+  attachments only for selected message detail, and keep the normalized MIME
+  payload bounded by the importer contract.
 - `apply_snapshot` is bounded, additive for unchanged UIDVALIDITY, and
   invalidates only the affected mailbox's memberships when UIDVALIDITY changes.
   Reject an oversized snapshot before any database mutation; do not delete absent older rows from a recent-header snapshot.
@@ -27,8 +36,10 @@ Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
 ## Coordination
 
 Schema, identity, or transaction changes require review with `mail-model`, `mail-sync`, and `mail-core`'s offline API. Changes to membership semantics
-also need Apple/UI consumers and migration fixtures checked. Incremental deletion
-reconciliation and offline actions are future slices, not implied by this importer.
+also need Apple/UI consumers and migration fixtures checked. Offline mark/read,
+ star, and move operations are per-membership overlays: preserve their
+ pending/failed/replay state, project moves with local-only memberships, and
+ reconcile them transactionally when the remote snapshot supplies the message.
 
 ## Validation
 

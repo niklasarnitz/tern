@@ -2,9 +2,10 @@
 
 ## Scope
 
-`mail-sync` orchestrates credential lookup, read-only IMAP fetching, and local snapshot persistence. The development CLI currently calls this seam; Swift only
-queries `mail-core`. Future Swift sync APIs should route through this crate,
-which owns IMAP and SQLite sequencing. Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
+`mail-sync` orchestrates credential lookup, bounded IMAP header/body fetching,
+and local snapshot persistence. The development CLI and Swift facade call this
+seam; it owns IMAP and SQLite sequencing. Inherit shared guidance from
+[`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
 
@@ -12,12 +13,15 @@ which owns IMAP and SQLite sequencing. Inherit shared guidance from [`../../../A
 - Complete the network fetch before `mail-db::Database::apply_snapshot` opens
   its write transaction. A timeout, TLS failure, authentication failure, or
   malformed response must leave the previous offline cache readable.
-- The implemented operation is a bounded Inbox header snapshot. Preserve
-  account and mailbox identity rules from `mail-db`, and propagate sanitized
-  errors without inventing remote behavior.
-- Incremental reconciliation, flags/actions, retries, IDLE, OAuth, and body
-  sync are future slices. Keep orchestration changes explicit about their new
-  transaction and conflict semantics.
+- Fetch headers first and fetch complete bodies only for bounded selected
+  messages. Pass MIME bytes through `mail-mime`; preserve normalized content,
+  threading metadata, and provider identity without putting secrets in the
+  store.
+- Mark/read, star, and move actions are offline per-membership operations.
+  Queue them only after validating mailbox membership, replay with bounded
+  durable retry state, and let UIDVALIDITY changes mark stale operations rather
+  than silently applying them to a new remote identity. Keep transaction ordering
+  explicit: finish network work before opening the store write transaction.
 
 ## Coordination
 
