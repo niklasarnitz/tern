@@ -4,7 +4,8 @@ use mail_model::{Account, MailboxSnapshot, RemoteHeader};
 
 #[test]
 fn ffi_api_reopens_a_persisted_snapshot_without_network() {
-    let path = std::env::temp_dir().join(format!("tern-offline-{}.sqlite", std::process::id()));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mail.sqlite");
     let path = path.to_str().unwrap();
     let mailbox_id;
     {

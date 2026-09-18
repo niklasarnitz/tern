@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jetify-com/devbox-install-action@v0.14.0
+      - uses: jetify-com/devbox-install-action@a0d2d53632934ae004f878c840055956d9f741b0 # v0.14.0
       - run: devbox run fmt
       - run: devbox run test
       - run: devbox run check
@@ -17,6 +17,6 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: jetify-com/devbox-install-action@v0.14.0
+      - uses: jetify-com/devbox-install-action@a0d2d53632934ae004f878c840055956d9f741b0 # v0.14.0
       - run: devbox run bindings
       - run: swift build --package-path apple

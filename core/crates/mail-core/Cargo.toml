@@ -16,3 +16,6 @@ clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 rpassword = "7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
