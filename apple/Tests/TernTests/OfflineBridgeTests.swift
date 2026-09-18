@@ -3,6 +3,33 @@ import Foundation
 import XCTest
 
 final class OfflineBridgeTests: XCTestCase {
+    func testSenderIdentityExposesAddressAndDetectsClaimedDomainMismatch() {
+        let suspicious = SenderIdentity("accounts.example.com <security@lookalike.test>")
+        XCTAssertEqual(suspicious.displayName, "accounts.example.com")
+        XCTAssertEqual(suspicious.address, "security@lookalike.test")
+        XCTAssertEqual(suspicious.domain, "lookalike.test")
+        XCTAssertNotNil(suspicious.mismatchWarning)
+
+        let legitimate = SenderIdentity("Example <notices@mail.example.com>")
+        XCTAssertEqual(legitimate.address, "notices@mail.example.com")
+        XCTAssertNil(legitimate.mismatchWarning)
+    }
+
+    func testExternalLinksExposeDestinationAndFlagVisibleHostMismatch() throws {
+        let destination = ExternalLinkDestination(
+            url: try XCTUnwrap(URL(string: "https://login.lookalike.test/session")),
+            visibleText: "https://accounts.example.com"
+        )
+        XCTAssertEqual(destination.host, "login.lookalike.test")
+        XCTAssertNotNil(destination.warning)
+
+        let detected = ExternalLinkDestination.detected(
+            in: "Review at https://safe.example.test/account before Friday."
+        )
+        XCTAssertEqual(detected.map(\.url.absoluteString), ["https://safe.example.test/account"])
+        XCTAssertNil(detected.first?.warning)
+    }
+
     func testReopensRustFixtureAndReadsBoundedPagesWithoutCredentials() throws {
         let path = try XCTUnwrap(ProcessInfo.processInfo.environment["TERN_TEST_DATABASE"])
         let mailboxID: String
