@@ -3,8 +3,9 @@
 ## Scope
 
 `mail-model` owns portable records shared by Rust and UniFFI; inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md). Exported records are
-`Account`, `Mailbox`, and `MessageSummary`; `RemoteHeader` and `MailboxSnapshot`
-are internal synchronization inputs.
+`Account`, `Mailbox`, `MessageSummary`, conversation records, and pending
+operation records cross the Rust/Swift boundary; `RemoteHeader` and
+`MailboxSnapshot` are internal synchronization inputs.
 
 ## Invariants
 
@@ -14,8 +15,10 @@ are internal synchronization inputs.
   UIDVALIDITY pair with the `account_id` supplied to `mail-db`; `MessageSummary.id` is a local row identity.
 - `MessageSummary.is_read` and `is_starred` describe mailbox membership state.
   `RemoteHeader` preserves the server UID and flags while MIME normalizes text.
-- Keep the current first slice focused on cached Inbox headers. Bodies,
-  attachments, SMTP, events, and provider-specific identity are future work.
+- `MessageContent` is normalized MIME data with bounded plain text, sanitized
+  HTML, and attachment bytes. `ThreadMessage.content` is optional so list
+  paths can remain lazy. Membership flags and pending operation replay state
+  belong to mailbox/action records, not message identity.
 
 ## Coordination
 

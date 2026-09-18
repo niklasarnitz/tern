@@ -8,6 +8,8 @@ Inherit [root instructions](../AGENTS.md). This directory currently contains a m
 - `Sources/Tern/TernApp.swift` owns native SwiftUI navigation, lists and detail presentation. Preserve macOS keyboard selection, toolbar/menu commands and system appearance. Implement future iOS navigation and lifecycle as platform-specific behavior.
 - Read local data through the application API. Add mail behavior in Rust before exposing it to Swift; Swift does not issue IMAP commands or SQL.
 - Paging replaces the displayed window. The current extra-row probe establishes whether another page exists; an exactly full page alone does not establish that. Reset paging and selection when changing mailboxes.
+- Conversations are the presentation unit when the application API exposes them: keep thread summaries bounded, load message metadata first, and request body/attachment content only for the selected detail. Render normalized MIME HTML as untrusted content; preserve the reversible plain-text quote toggle and keep navigation/network policy locked down in any web view.
+- Mailbox flags and offline actions are per-membership state. Optimistic mark/star/move projections must remain identifiable until replay, show pending/failed state, and use the store's bounded retry/replay contract rather than inventing local persistence.
 - Account/mailbox changes can overlap suspended requests. Apply results, errors and loading-state changes only to the request that still owns the current selection. Reload must discover newly configured accounts and newly cached mailboxes.
 - Keep empty, loading, error and retry states usable. Display fixture mail only through explicitly selected fixture databases.
 

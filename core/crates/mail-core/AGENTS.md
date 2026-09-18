@@ -4,8 +4,10 @@
 
 `mail-core` is the stable application facade exposed to Apple through UniFFI.
 The current `MailClient` opens the canonical local store and offers read-only
-account, mailbox, and bounded message-list queries. The CLI is the development
-owner of account configuration and sync. Inherit shared guidance from
+account, mailbox, bounded message-list, conversation, and pending-operation
+queries. Message bodies and attachments are loaded through the selected detail
+path, while list APIs remain metadata-only. The CLI is the development owner
+of account configuration and sync. Inherit shared guidance from
 [`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
@@ -13,8 +15,9 @@ owner of account configuration and sync. Inherit shared guidance from
 - Keep the foreign API expressed in `mail-model` records and sanitized
   `MailError` values. Exported methods must remain safe to call after reopening
   an offline database and must not perform network work implicitly.
-- Message pages remain bounded by the database contract. Avoid exposing whole
-  mailboxes or SQLite/IMAP implementation types across UniFFI.
+- Message and conversation pages remain bounded by the database contract. Keep
+  body/attachment payloads lazy and avoid exposing whole mailboxes or
+  SQLite/IMAP implementation types across UniFFI.
 - The CLI may prompt for a password without echo and invoke `mail-sync`; JSON
   account configuration stores a credential reference only. Apple onboarding
   must later supply Keychain-backed credentials.

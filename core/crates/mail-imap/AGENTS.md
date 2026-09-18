@@ -13,9 +13,10 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 - Use the platform certificate roots and implicit TLS. The current slice has no
   STARTTLS downgrade path, certificate override, or Gmail password login;
   Gmail requires the future OAuth path.
-- `EXAMINE` and `BODY.PEEK` keep header sync read-only. Keep the bounded recent
-  fetch, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and timeout
-  behavior intact.
+- `EXAMINE` and `BODY.PEEK` keep sync read-only. Keep bounded recent header and
+  body fetches, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and
+  timeout behavior intact. Body fetches must honor the MIME byte budget before
+  handing data to normalization.
 - `async-imap` convenience streaming helpers can discard tagged failure status.
   Retain the `run_command`/`read_response` typed adapter: drain until the
   matching request tag, inspect its status, and reject tagged `NO`/non-OK.
@@ -26,8 +27,9 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 
 Protocol or snapshot changes require coordination with `mail-mime`,
 `mail-model`, `mail-sync`, and `mail-db` identity rules. STARTTLS, OAuth,
-incremental sync, IDLE, mutations, bodies, and attachments are future slices;
-do not introduce placeholder SMTP/events/OAuth implementations here.
+incremental sync, IDLE, and SMTP remain future work. Message bodies and
+attachments flow through the bounded MIME normalization path; mutations remain
+owned by store/sync orchestration.
 
 ## Validation
 
