@@ -1,0 +1,13 @@
+[package]
+name = "mail-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mail-model.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
