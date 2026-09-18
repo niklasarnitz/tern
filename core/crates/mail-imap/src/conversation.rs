@@ -308,6 +308,9 @@ mod tests {
             action,
             destination_mailbox_id: Some("archive".into()),
             destination_remote_name: Some("Archive".into()),
+            retry_count: 0,
+            last_error: None,
+            can_replay: true,
         }
     }
 
