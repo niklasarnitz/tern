@@ -298,6 +298,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_encoded_subject_and_sender() {
+        let raw = concat!(
+            "Message-ID: <abc@example.test>\r\n",
+            "From: =?UTF-8?Q?J=C3=B6rg?= <joerg@example.test>\r\n",
+            "Subject: =?UTF-8?Q?Gr=C3=BC=C3=9Fe?=\r\n",
+            "Date: Tue, 17 Sep 2026 08:30:00 +0000\r\n\r\n"
+        );
+        let parsed = parse_header(42, raw.as_bytes(), true, false);
+        assert_eq!(parsed.message_id.as_deref(), Some("abc@example.test"));
+        assert_eq!(parsed.subject, "Grüße");
+        assert_eq!(parsed.sender, "Jörg <joerg@example.test>");
+    }
+
+    #[test]
+    fn malformed_headers_preserve_uid_and_flags() {
+        let parsed = parse_header(7, b"Subject: =?not-valid\r\n\r\n", false, true);
+        assert_eq!(parsed.uid, 7);
+        assert!(!parsed.is_read);
+        assert!(parsed.is_starred);
+    }
+
+    #[test]
     fn parse_header_retains_thread_metadata() {
         let raw = concat!(
             "Message-ID: <new@example.test>\r\n",
