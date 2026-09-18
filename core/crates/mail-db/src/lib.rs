@@ -7,9 +7,9 @@
 use std::{ops::Deref, path::Path};
 
 use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Type, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -20,6 +20,10 @@ pub enum DatabaseError {
     Sqlite(#[from] rusqlite::Error),
     #[error("unsupported database schema version {0}")]
     UnsupportedSchemaVersion(i64),
+    #[error("cannot change remote identity for account {account_id} after mailboxes are cached")]
+    RemoteIdentityChange { account_id: String },
+    #[error("snapshot contains {actual} headers; maximum is {max}")]
+    SnapshotTooLarge { actual: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -32,6 +36,10 @@ pub struct Database {
 
 impl Database {
     /// Open (or create) a database and run all pending migrations.
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot open the path or initialize the
+    /// schema.
     pub fn open(path: &str) -> Result<Self> {
         let connection = Connection::open(Path::new(path))?;
         // Foreign keys must be enabled before any transaction starts. WAL is
@@ -41,7 +49,42 @@ impl Database {
         Ok(Self { connection })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the account or when changing a
+    /// cached account's remote identity would invalidate its mailbox cache.
     pub fn upsert_account(&self, account: &Account) -> Result<()> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT imap_host, imap_port, username FROM accounts WHERE id = ?1",
+                [&account.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((imap_host, imap_port, username)) = existing {
+            let remote_identity_changed = imap_host != account.imap_host
+                || imap_port != i64::from(account.imap_port)
+                || username != account.username;
+            if remote_identity_changed {
+                let has_cached_mailboxes: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = ?1)",
+                    [&account.id],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )?;
+                if has_cached_mailboxes {
+                    return Err(DatabaseError::RemoteIdentityChange {
+                        account_id: account.id.clone(),
+                    });
+                }
+            }
+        }
         self.connection.execute(
             "INSERT INTO accounts
                 (id, email, display_name, imap_host, imap_port, username, credential_ref)
@@ -66,6 +109,9 @@ impl Database {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read the account rows.
     pub fn list_accounts(&self) -> Result<Vec<Account>> {
         let mut statement = self.connection.prepare(
             "SELECT id, email, display_name, imap_host, imap_port, username, credential_ref
@@ -77,7 +123,7 @@ impl Database {
                 email: row.get(1)?,
                 display_name: row.get(2)?,
                 imap_host: row.get(3)?,
-                imap_port: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+                imap_port: u16_from_sql(row.get::<_, i64>(4)?, 4)?,
                 username: row.get(5)?,
                 credential_ref: row.get(6)?,
             })
@@ -86,6 +132,9 @@ impl Database {
             .map_err(DatabaseError::from)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read the mailbox rows.
     pub fn list_mailboxes(&self, account_id: &str) -> Result<Vec<Mailbox>> {
         let mut statement = self.connection.prepare(
             "SELECT id, account_id, remote_name, display_name, uid_validity, uid_next
@@ -97,8 +146,14 @@ impl Database {
                 account_id: row.get(1)?,
                 remote_name: row.get(2)?,
                 display_name: row.get(3)?,
-                uid_validity: row.get::<_, Option<i64>>(4)?.map(|value| value as u32),
-                uid_next: row.get::<_, Option<i64>>(5)?.map(|value| value as u32),
+                uid_validity: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(|value| u32_from_sql(value, 4))
+                    .transpose()?,
+                uid_next: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| u32_from_sql(value, 5))
+                    .transpose()?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -111,7 +166,18 @@ impl Database {
     /// remain cached. A changed UIDVALIDITY invalidates only this mailbox's
     /// memberships; message rows that are still referenced by another mailbox
     /// are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is too large, the account is absent,
+    /// or `SQLite` cannot commit the snapshot transaction.
     pub fn apply_snapshot(&self, account_id: &str, snapshot: &MailboxSnapshot) -> Result<Mailbox> {
+        if snapshot.headers.len() > MAX_SNAPSHOT_HEADERS {
+            return Err(DatabaseError::SnapshotTooLarge {
+                actual: snapshot.headers.len(),
+                max: MAX_SNAPSHOT_HEADERS,
+            });
+        }
         let transaction = self.connection.unchecked_transaction()?;
         let mailbox_id = mailbox_id(account_id, &snapshot.remote_name);
         let existing = transaction
@@ -158,7 +224,6 @@ impl Database {
 
         let mut headers = snapshot.headers.clone();
         headers.sort_by_key(|header| std::cmp::Reverse(header.uid));
-        headers.truncate(MAX_SNAPSHOT_HEADERS);
         for header in &headers {
             upsert_header(
                 &transaction,
@@ -181,6 +246,10 @@ impl Database {
     }
 
     /// List at most [`MAX_PAGE_SIZE`] messages, newest remote UID first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read the requested page.
     pub fn list_messages(
         &self,
         mailbox_id: &str,
@@ -207,7 +276,7 @@ impl Database {
                 Ok(MessageSummary {
                     id: row.get(0)?,
                     mailbox_id: row.get(1)?,
-                    remote_uid: row.get::<_, i64>(2)? as u32,
+                    remote_uid: u32_from_sql(row.get::<_, i64>(2)?, 2)?,
                     subject: row.get(3)?,
                     sender: row.get(4)?,
                     date: row.get(5)?,
@@ -271,7 +340,16 @@ fn migrate(connection: &Connection) -> Result<()> {
              CREATE INDEX mailbox_messages_page_idx
                  ON mailbox_messages(mailbox_id, uid_validity, remote_uid DESC);
              CREATE INDEX messages_account_idx ON messages(account_id);
-             PRAGMA user_version = 1;
+             CREATE INDEX mailbox_messages_message_id_idx ON mailbox_messages(message_id);
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+    } else if version == 1 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
+                 ON mailbox_messages(message_id);
+             PRAGMA user_version = 2;
              COMMIT;",
         )?;
     }
@@ -284,8 +362,26 @@ fn mailbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mailbox> {
         account_id: row.get(1)?,
         remote_name: row.get(2)?,
         display_name: row.get(3)?,
-        uid_validity: row.get::<_, Option<i64>>(4)?.map(|value| value as u32),
-        uid_next: row.get::<_, Option<i64>>(5)?.map(|value| value as u32),
+        uid_validity: row
+            .get::<_, Option<i64>>(4)?
+            .map(|value| u32_from_sql(value, 4))
+            .transpose()?,
+        uid_next: row
+            .get::<_, Option<i64>>(5)?
+            .map(|value| u32_from_sql(value, 5))
+            .transpose()?,
+    })
+}
+
+fn u16_from_sql(value: i64, column: usize) -> rusqlite::Result<u16> {
+    u16::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
+fn u32_from_sql(value: i64, column: usize) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })
 }
 
@@ -358,8 +454,8 @@ where
             message_row_id,
             i64::from(uid_validity),
             i64::from(header.uid),
-            i64::from(header.is_read as u8),
-            i64::from(header.is_starred as u8),
+            i64::from(u8::from(header.is_read)),
+            i64::from(u8::from(header.is_starred)),
         ],
     )?;
     Ok(())
@@ -388,6 +484,7 @@ fn message_id(mailbox_id: &str, uid_validity: u32, remote_uid: u32) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
@@ -497,10 +594,81 @@ mod tests {
     fn pagination_is_bounded() {
         let db = Database::open(":memory:").unwrap();
         db.upsert_account(&account("one")).unwrap();
-        let headers = (1..=250).collect::<Vec<_>>();
-        db.apply_snapshot("one", &snapshot("INBOX", 1, &headers))
+        let first_batch = (1..=200).collect::<Vec<_>>();
+        let second_batch = (201..=250).collect::<Vec<_>>();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &first_batch))
+            .unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &second_batch))
             .unwrap();
         let mailbox = db.list_mailboxes("one").unwrap().pop().unwrap();
         assert_eq!(db.list_messages(&mailbox.id, 0, 10_000).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_without_changing_cached_rows() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1, 2]))
+            .unwrap();
+        let mailbox = db.list_mailboxes("one").unwrap().pop().unwrap();
+        let oversized_uids =
+            (1..=(u32::try_from(MAX_SNAPSHOT_HEADERS).unwrap() + 1)).collect::<Vec<_>>();
+        let oversized = snapshot("INBOX", 1, &oversized_uids);
+
+        let error = db.apply_snapshot("one", &oversized).unwrap_err();
+        assert!(matches!(
+            error,
+            DatabaseError::SnapshotTooLarge {
+                actual,
+                max: MAX_SNAPSHOT_HEADERS
+            } if actual == MAX_SNAPSHOT_HEADERS + 1
+        ));
+        let messages = db.list_messages(&mailbox.id, 0, 20).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].remote_uid, 2);
+    }
+
+    #[test]
+    fn foreign_key_failure_rolls_back_mailbox_insert() {
+        let db = Database::open(":memory:").unwrap();
+        let error = db
+            .apply_snapshot("missing-account", &snapshot("INBOX", 1, &[1]))
+            .unwrap_err();
+        assert!(matches!(error, DatabaseError::Sqlite(_)));
+        assert!(db.list_mailboxes("missing-account").unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_message_ids_remain_distinct_by_uid() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let mut snapshot = snapshot("INBOX", 1, &[1, 2]);
+        snapshot.headers[1].message_id = snapshot.headers[0].message_id.clone();
+        db.apply_snapshot("one", &snapshot).unwrap();
+        let mailbox = db.list_mailboxes("one").unwrap().pop().unwrap();
+        let messages = db.list_messages(&mailbox.id, 0, 20).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].id, messages[1].id);
+        assert_ne!(messages[0].remote_uid, messages[1].remote_uid);
+    }
+
+    #[test]
+    fn cached_mailboxes_reject_remote_identity_change() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+        let mut changed = account("one");
+        changed.imap_host = "other.example.test".into();
+
+        let error = db.upsert_account(&changed).unwrap_err();
+        assert!(matches!(
+            error,
+            DatabaseError::RemoteIdentityChange { account_id } if account_id == "one"
+        ));
+        assert_eq!(
+            db.list_accounts().unwrap()[0].imap_host,
+            "imap.example.test"
+        );
     }
 }
