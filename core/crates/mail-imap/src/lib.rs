@@ -1,4 +1,4 @@
-//! Read-only IMAP synchronization for the first vertical slice.
+//! Verified IMAP synchronization and queued application operations.
 //!
 //! Connections use implicit TLS on the configured port and the platform
 //! certificate store.  This crate intentionally does not offer STARTTLS, certificate
@@ -29,6 +29,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADERS: u32 = 100;
 
+mod conversation;
+pub use conversation::{apply_operation, fetch_mailbox};
+
 type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 type ImapSession = Session<TlsStream>;
 
@@ -57,6 +60,14 @@ pub enum ImapError {
     MissingUidMetadata,
     #[error("the server did not provide a message header")]
     MissingHeader,
+    #[error("the message exceeds the supported download limit")]
+    MessageTooLarge,
+    #[error("the message body could not be decoded")]
+    InvalidMime,
+    #[error("the mailbox identity changed; this operation cannot be replayed")]
+    StaleMailbox,
+    #[error("the server does not support safe message moves")]
+    MoveUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, ImapError>;
@@ -84,9 +95,20 @@ async fn fetch_inbox_session<T>(session: &mut Session<T>) -> Result<MailboxSnaps
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    // EXAMINE keeps this first slice strictly read-only.  It does not mark
+    fetch_headers_session(session, "INBOX", false).await
+}
+
+async fn fetch_headers_session<T>(
+    session: &mut Session<T>,
+    remote_name: &str,
+    gmail: bool,
+) -> Result<MailboxSnapshot>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    // EXAMINE keeps header reads strictly read-only.  It does not mark
     // recent messages as seen and cannot mutate mailbox state.
-    let mailbox = timeout(OPERATION_TIMEOUT, session.examine("INBOX"))
+    let mailbox = timeout(OPERATION_TIMEOUT, session.examine(remote_name))
         .await
         .map_err(|_| ImapError::Timeout)?
         .map_err(|_| ImapError::Protocol)?;
@@ -97,10 +119,11 @@ where
     } else {
         let first_sequence = mailbox.exists.saturating_sub(MAX_HEADERS - 1).max(1);
         let sequence_set = format!("{first_sequence}:{}", mailbox.exists);
+        let provider_fields = if gmail { "X-GM-MSGID X-GM-THRID " } else { "" };
         let request_id = timeout(
             OPERATION_TIMEOUT,
             session.run_command(format!(
-                "FETCH {sequence_set} (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE)])"
+                "FETCH {sequence_set} (UID FLAGS INTERNALDATE {provider_fields}BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT FROM TO CC DATE)])"
             )),
         )
         .await
@@ -140,6 +163,20 @@ where
                     if let Some(internal_date) = fetch.internal_date.and_then(parse_internal_date) {
                         header.date = internal_date.to_rfc3339();
                     }
+                    header.provider_message_id = attributes.iter().find_map(|attribute| {
+                        if let AttributeValue::GmailMsgId(value) = attribute {
+                            Some(value.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    header.provider_thread_id = attributes.iter().find_map(|attribute| {
+                        if let AttributeValue::GmailThrId(value) = attribute {
+                            Some(value.to_string())
+                        } else {
+                            None
+                        }
+                    });
                     headers.push(header);
                 }
                 Response::Done { tag, status, .. } if tag == &request_id => {
@@ -165,7 +202,7 @@ where
     };
 
     Ok(MailboxSnapshot {
-        remote_name: "INBOX".to_owned(),
+        remote_name: remote_name.to_owned(),
         uid_validity,
         uid_next: mailbox.uid_next,
         headers,
