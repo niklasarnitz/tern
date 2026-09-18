@@ -74,10 +74,18 @@ pub struct ThreadMessage {
     pub recipients: Vec<String>,
     pub cc: Vec<String>,
     pub mailbox_ids: Vec<String>,
+    pub memberships: Vec<MessageMembership>,
     pub is_read: bool,
     pub is_starred: bool,
     pub content: Option<MessageContent>,
     pub display_plain_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
+pub struct MessageMembership {
+    pub mailbox_id: String,
+    pub is_read: bool,
+    pub is_starred: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -101,6 +109,8 @@ pub struct PendingOperation {
     pub action: MailAction,
     pub destination_mailbox_id: Option<String>,
     pub destination_remote_name: Option<String>,
+    pub retry_count: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
