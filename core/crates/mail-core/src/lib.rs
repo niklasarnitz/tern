@@ -72,5 +72,22 @@ impl MailClient {
             .list_messages(&mailbox_id, offset, limit)
             .map_err(storage)
     }
+    /// Search the local cache with free text and structured operators.
+    ///
+    /// # Errors
+    /// Returns a storage error if the query is malformed or the database
+    /// cannot be read.
+    pub fn search_messages(
+        &self,
+        query: String,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .search_messages(&query, offset, limit)
+            .map_err(storage)
+    }
 }
 uniffi::setup_scaffolding!();

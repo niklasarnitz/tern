@@ -45,6 +45,12 @@ final class OfflineBridgeTests: XCTestCase {
             XCTAssertEqual(firstPage.first?.remoteUid, 105)
             XCTAssertEqual(firstPage.first?.subject, "Offline message 105")
             XCTAssertEqual(firstPage.first?.isStarred, true)
+            let search = try firstClient.searchMessages(
+                query: "subject:\"Offline message 95\" to:reader@example.invalid is:starred",
+                offset: 0,
+                limit: 10
+            )
+            XCTAssertEqual(search.map(\.remoteUid), [95])
             mailboxID = mailbox.id
         }
 
@@ -73,6 +79,22 @@ final class OfflineBridgeTests: XCTestCase {
         await store.refresh()
         XCTAssertNil(store.errorMessage)
         XCTAssertEqual(store.accounts.count, 1)
+        XCTAssertEqual(store.messages.count, 100)
+    }
+
+    @MainActor
+    func testNativeStoreSearchesAndRestoresTheMailboxPage() async {
+        let store = MailStore()
+        await store.start()
+        store.searchText = "subject:\"Offline message 95\" is:starred"
+        await store.submitSearch()
+        XCTAssertNil(store.errorMessage)
+        XCTAssertTrue(store.isSearching)
+        XCTAssertEqual(store.messages.map(\.remoteUid), [95])
+
+        store.searchText = ""
+        await store.clearSearch()
+        XCTAssertFalse(store.isSearching)
         XCTAssertEqual(store.messages.count, 100)
     }
 }

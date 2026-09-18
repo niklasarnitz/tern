@@ -25,6 +25,10 @@ private actor MailCoreActor {
     func listMessages(mailboxID: String, offset: UInt32, limit: UInt32) throws -> [MessageSummary] {
         try client.listMessages(mailboxId: mailboxID, offset: offset, limit: limit)
     }
+
+    func searchMessages(query: String, offset: UInt32, limit: UInt32) throws -> [MessageSummary] {
+        try client.searchMessages(query: query, offset: offset, limit: limit)
+    }
 }
 
 @MainActor
@@ -41,6 +45,8 @@ final class MailStore: ObservableObject {
     @Published var selectedMailboxID: String?
     @Published var selectedMessageID: String?
     @Published var selectedSidebarItem: SidebarItem?
+    @Published var searchText = ""
+    @Published private(set) var activeSearchQuery: String?
 
     private var core: MailCoreActor?
     private var started = false
@@ -60,6 +66,10 @@ final class MailStore: ObservableObject {
 
     var selectedMessage: MessageSummary? {
         messages.first { $0.id == selectedMessageID }
+    }
+
+    var isSearching: Bool {
+        activeSearchQuery != nil
     }
 
     func start() async {
@@ -122,6 +132,8 @@ final class MailStore: ObservableObject {
         selectedAccountID = account.id
         selectedMailboxID = nil
         selectedMessageID = nil
+        searchText = ""
+        activeSearchQuery = nil
         messageOffset = 0
         hasNextMessagePage = false
         isLoadingAccounts = false
@@ -146,6 +158,8 @@ final class MailStore: ObservableObject {
         }
         selectedMailboxID = mailbox.id
         selectedMessageID = nil
+        searchText = ""
+        activeSearchQuery = nil
         messageOffset = 0
         hasNextMessagePage = false
         isLoadingAccounts = false
@@ -172,16 +186,53 @@ final class MailStore: ObservableObject {
     }
 
     func nextMessagePage() async {
-        guard !isLoadingMessages, hasNextMessagePage,
-              let mailboxID = selectedMailboxID, let core,
+        guard !isLoadingMessages, hasNextMessagePage, let core,
               messageOffset <= UInt32.max - messagePageSize else { return }
-        await loadMessages(mailboxID: mailboxID, offset: messageOffset + messagePageSize, using: core)
+        let offset = messageOffset + messagePageSize
+        if let activeSearchQuery {
+            await loadSearch(query: activeSearchQuery, offset: offset, using: core)
+        } else if let mailboxID = selectedMailboxID {
+            await loadMessages(mailboxID: mailboxID, offset: offset, using: core)
+        }
     }
 
     func previousMessagePage() async {
-        guard !isLoadingMessages, messageOffset > 0,
-              let mailboxID = selectedMailboxID, let core else { return }
-        await loadMessages(mailboxID: mailboxID, offset: messageOffset - messagePageSize, using: core)
+        guard !isLoadingMessages, messageOffset > 0, let core else { return }
+        let offset = messageOffset - messagePageSize
+        if let activeSearchQuery {
+            await loadSearch(query: activeSearchQuery, offset: offset, using: core)
+        } else if let mailboxID = selectedMailboxID {
+            await loadMessages(mailboxID: mailboxID, offset: offset, using: core)
+        }
+    }
+
+    func submitSearch() async {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, let core else {
+            await clearSearch()
+            return
+        }
+        requestGeneration &+= 1
+        activeSearchQuery = query
+        selectedMessageID = nil
+        messageOffset = 0
+        hasNextMessagePage = false
+        messages = []
+        errorMessage = nil
+        await loadSearch(query: query, offset: 0, using: core)
+    }
+
+    func clearSearch() async {
+        guard activeSearchQuery != nil else { return }
+        requestGeneration &+= 1
+        activeSearchQuery = nil
+        selectedMessageID = nil
+        messageOffset = 0
+        hasNextMessagePage = false
+        messages = []
+        errorMessage = nil
+        guard let mailboxID = selectedMailboxID, let core else { return }
+        await loadMessages(mailboxID: mailboxID, offset: 0, using: core)
     }
 
     private func loadAccounts() async {
@@ -224,7 +275,11 @@ final class MailStore: ObservableObject {
             isLoadingMailboxes = false
             if let selectedMailboxID, let selected = mailboxes.first(where: { $0.id == selectedMailboxID }) {
                 setSidebarSelection(.mailbox(selected.id))
-                await loadMessages(mailboxID: selected.id, offset: messageOffset, using: core)
+                if let activeSearchQuery {
+                    await loadSearch(query: activeSearchQuery, offset: messageOffset, using: core)
+                } else {
+                    await loadMessages(mailboxID: selected.id, offset: messageOffset, using: core)
+                }
             } else if let first = mailboxes.first {
                 await selectMailbox(first, invalidateRequest: false)
             } else {
@@ -262,6 +317,31 @@ final class MailStore: ObservableObject {
             hasNextMessagePage = loadedMessages.count > Int(messagePageSize)
         } catch {
             if generation == requestGeneration {
+                errorMessage = Self.message(for: error)
+            }
+        }
+    }
+
+    private func loadSearch(query: String, offset: UInt32, using core: MailCoreActor) async {
+        let generation = requestGeneration
+        isLoadingMessages = true
+        defer {
+            if generation == requestGeneration, activeSearchQuery == query {
+                isLoadingMessages = false
+            }
+        }
+        do {
+            let loadedMessages = try await core.searchMessages(
+                query: query,
+                offset: offset,
+                limit: messagePageSize + 1
+            )
+            guard generation == requestGeneration, activeSearchQuery == query else { return }
+            messages = Array(loadedMessages.prefix(Int(messagePageSize)))
+            messageOffset = offset
+            hasNextMessagePage = loadedMessages.count > Int(messagePageSize)
+        } catch {
+            if generation == requestGeneration, activeSearchQuery == query {
                 errorMessage = Self.message(for: error)
             }
         }

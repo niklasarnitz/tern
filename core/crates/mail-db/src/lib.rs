@@ -7,12 +7,13 @@
 use std::{collections::HashMap, ops::Deref, path::Path};
 
 use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
-use rusqlite::{params, types::Type, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Type, types::Value, Connection, OptionalExtension};
 
 mod conversations;
 mod mutations;
+mod search;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -43,6 +44,8 @@ pub enum DatabaseError {
     PendingOperationNotFound(String),
     #[error("mail data could not be serialized: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("invalid search: {message}")]
+    InvalidSearch { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -314,6 +317,134 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }
+
+    /// Search the local cache with free text and structured operators.
+    ///
+    /// Free text and `from:`, `to:`, and `subject:` use the FTS index. The
+    /// indexed predicates are `before:YYYY-MM-DD`, `after:YYYY-MM-DD`,
+    /// `has:attachment`, `is:unread`, `is:starred`, `in:`, and `account:`.
+    /// Results include at most [`MAX_PAGE_SIZE`] logical messages. Values
+    /// containing spaces can be enclosed in double quotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed dates or quoted values, or when `SQLite`
+    /// cannot execute the search.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>> {
+        let plan = search::parse(query)?;
+        let limit = limit.min(MAX_PAGE_SIZE);
+        let mut sql = String::from(
+            "SELECT msg.id, MIN(mm.mailbox_id), MAX(mm.remote_uid),
+                    msg.subject, msg.sender, msg.date, msg.snippet,
+                    MIN(mm.is_read), MAX(mm.is_starred), msg.has_attachments
+             FROM mailbox_messages AS mm
+             JOIN mailboxes AS mb ON mb.id = mm.mailbox_id
+             JOIN messages AS msg ON msg.id = mm.message_id
+             JOIN accounts AS acc ON acc.id = msg.account_id",
+        );
+        let mut values = Vec::new();
+        if let Some(fts_query) = &plan.fts_query {
+            sql.push_str(" JOIN messages_fts ON messages_fts.rowid = msg.rowid");
+            sql.push_str(
+                " WHERE mb.uid_validity IS NOT NULL
+                    AND mm.uid_validity = mb.uid_validity
+                    AND messages_fts MATCH ?",
+            );
+            values.push(Value::Text(fts_query.clone()));
+        } else {
+            sql.push_str(
+                " WHERE mb.uid_validity IS NOT NULL
+                    AND mm.uid_validity = mb.uid_validity",
+            );
+        }
+        for timestamp in plan.before {
+            sql.push_str(" AND msg.sent_at < ?");
+            values.push(Value::Integer(timestamp));
+        }
+        for timestamp in plan.after {
+            sql.push_str(" AND msg.sent_at >= ?");
+            values.push(Value::Integer(timestamp));
+        }
+        if plan.has_attachments {
+            sql.push_str(" AND msg.has_attachments = 1");
+        }
+        if plan.is_unread {
+            sql.push_str(" AND mm.is_read = 0");
+        }
+        if plan.is_starred {
+            sql.push_str(" AND mm.is_starred = 1");
+        }
+        append_text_filter(
+            &mut sql,
+            &mut values,
+            &plan.mailboxes,
+            &["mb.remote_name", "mb.display_name"],
+        );
+        append_text_filter(
+            &mut sql,
+            &mut values,
+            &plan.accounts,
+            &["acc.id", "acc.email", "acc.display_name"],
+        );
+        sql.push_str(" GROUP BY msg.id");
+        sql.push_str(" ORDER BY COALESCE(msg.sent_at, 0) DESC, msg.id");
+        sql.push_str(" LIMIT ? OFFSET ?");
+        values.push(Value::Integer(i64::from(limit)));
+        values.push(Value::Integer(i64::from(offset)));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values.iter()), message_summary_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+}
+
+fn append_text_filter(
+    sql: &mut String,
+    parameters: &mut Vec<Value>,
+    values: &[String],
+    columns: &[&str],
+) {
+    if values.is_empty() {
+        return;
+    }
+    sql.push_str(" AND (");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push('(');
+        for (column_index, column) in columns.iter().enumerate() {
+            if column_index > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str(column);
+            sql.push_str(" = ? COLLATE NOCASE");
+            parameters.push(Value::Text(value.clone()));
+        }
+        sql.push(')');
+    }
+    sql.push(')');
+}
+
+fn message_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
+    Ok(MessageSummary {
+        id: row.get(0)?,
+        mailbox_id: row.get(1)?,
+        remote_uid: u32_from_sql(row.get::<_, i64>(2)?, 2)?,
+        subject: row.get(3)?,
+        sender: row.get(4)?,
+        date: row.get(5)?,
+        snippet: row.get(6)?,
+        is_read: row.get::<_, i64>(7)? != 0,
+        is_starred: row.get::<_, i64>(8)? != 0,
+        has_attachments: row.get::<_, i64>(9)? != 0,
+    })
 }
 
 // Schema text stays together so each migration transaction is reviewable.
@@ -409,6 +540,7 @@ fn migrate(connection: &Connection) -> Result<()> {
              PRAGMA user_version = 3;
              COMMIT;",
         )?;
+        version = 3;
     }
     let mut migration_open = false;
     if version == 1 {
@@ -468,7 +600,65 @@ fn migrate(connection: &Connection) -> Result<()> {
         )?;
         backfill_threads(connection)?;
         connection.execute_batch("PRAGMA user_version = 3; COMMIT;")?;
+        version = 3;
     }
+    if version == 3 {
+        migrate_search(connection)?;
+    }
+    Ok(())
+}
+
+fn migrate_search(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         UPDATE messages SET sent_at = unixepoch(date)
+             WHERE sent_at IS NULL AND unixepoch(date) IS NOT NULL;
+         CREATE INDEX messages_sent_at_idx ON messages(sent_at);
+         CREATE INDEX messages_has_attachments_idx ON messages(has_attachments);
+         CREATE INDEX mailbox_messages_unread_idx
+             ON mailbox_messages(mailbox_id) WHERE is_read = 0;
+         CREATE INDEX mailbox_messages_starred_idx
+             ON mailbox_messages(mailbox_id) WHERE is_starred = 1;
+         CREATE INDEX mailboxes_remote_name_idx ON mailboxes(remote_name COLLATE NOCASE);
+         CREATE INDEX mailboxes_display_name_idx ON mailboxes(display_name COLLATE NOCASE);
+         CREATE INDEX accounts_email_idx ON accounts(email COLLATE NOCASE);
+         CREATE INDEX accounts_display_name_idx ON accounts(display_name COLLATE NOCASE);
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+             subject, sender, recipients_json, cc_json, snippet,
+             content = 'messages', content_rowid = 'rowid'
+         );
+         CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+             INSERT INTO messages_fts(
+                 rowid, subject, sender, recipients_json, cc_json, snippet
+             ) VALUES (
+                 new.rowid, new.subject, new.sender, new.recipients_json, new.cc_json, new.snippet
+             );
+         END;
+         CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+             INSERT INTO messages_fts(
+                 messages_fts, rowid, subject, sender, recipients_json, cc_json, snippet
+             ) VALUES (
+                 'delete', old.rowid, old.subject, old.sender,
+                 old.recipients_json, old.cc_json, old.snippet
+             );
+         END;
+         CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+             INSERT INTO messages_fts(
+                 messages_fts, rowid, subject, sender, recipients_json, cc_json, snippet
+             ) VALUES (
+                 'delete', old.rowid, old.subject, old.sender,
+                 old.recipients_json, old.cc_json, old.snippet
+             );
+             INSERT INTO messages_fts(
+                 rowid, subject, sender, recipients_json, cc_json, snippet
+             ) VALUES (
+                 new.rowid, new.subject, new.sender, new.recipients_json, new.cc_json, new.snippet
+             );
+         END;
+         INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+         PRAGMA user_version = 4;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -1176,7 +1366,7 @@ fn message_id(mailbox_id: &str, uid_validity: u32, remote_uid: u32) -> String {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use mail_model::{MailAction, MessageContent};
+    use mail_model::{Attachment, MailAction, MessageContent};
     use tempfile::NamedTempFile;
 
     fn account(id: &str) -> Account {
@@ -2075,5 +2265,123 @@ mod tests {
         let threads = db.list_threads("mbx:3:one:5:INBOX", 0, 20).unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].message_count, 2);
+        let search = db
+            .search_messages("subject:Parent before:2026-02-01", 0, 20)
+            .unwrap();
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].id, "legacy-parent");
+    }
+
+    #[test]
+    fn structured_search_combines_fts_and_relational_filters() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("work")).unwrap();
+        db.upsert_account(&account("personal")).unwrap();
+
+        let matching = RemoteHeader {
+            uid: 1,
+            message_id: Some("<roadmap@example.test>".into()),
+            subject: "Quarterly roadmap".into(),
+            sender: "Ada Lovelace <ada@example.test>".into(),
+            date: "2026-09-15T12:00:00Z".into(),
+            recipients: vec!["Tern Team <team@example.test>".into()],
+            sent_at: Some(1_789_473_600),
+            content: Some(MessageContent {
+                plain_text: "The launch plan is ready.".into(),
+                attachments: vec![Attachment {
+                    filename: "plan.pdf".into(),
+                    ..Attachment::default()
+                }],
+                ..MessageContent::default()
+            }),
+            is_read: false,
+            is_starred: true,
+            ..RemoteHeader::default()
+        };
+        let decoy = RemoteHeader {
+            uid: 2,
+            message_id: Some("<budget@example.test>".into()),
+            subject: "Quarterly budget".into(),
+            sender: "Grace Hopper <grace@example.test>".into(),
+            date: "2026-10-15T12:00:00Z".into(),
+            recipients: vec!["Other <other@example.test>".into()],
+            sent_at: Some(1_792_065_600),
+            content: Some(MessageContent {
+                plain_text: "The launch plan changed.".into(),
+                ..MessageContent::default()
+            }),
+            is_read: true,
+            is_starred: false,
+            ..RemoteHeader::default()
+        };
+        db.apply_snapshot(
+            "work",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(3),
+                headers: vec![matching.clone(), decoy],
+            },
+        )
+        .unwrap();
+        let mut archived = matching.clone();
+        archived.uid = 3;
+        db.apply_snapshot(
+            "work",
+            &MailboxSnapshot {
+                remote_name: "Archive".into(),
+                uid_validity: 1,
+                uid_next: Some(4),
+                headers: vec![archived],
+            },
+        )
+        .unwrap();
+        let mut personal = matching;
+        personal.uid = 4;
+        db.apply_snapshot(
+            "personal",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(5),
+                headers: vec![personal],
+            },
+        )
+        .unwrap();
+
+        let results = db
+            .search_messages(
+                "launch from:ada@example.test to:team@example.test subject:roadmap \
+                 after:2026-09-01 before:2026-10-01 has:attachment is:unread \
+                 is:starred in:INBOX account:work",
+                0,
+                20,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].remote_uid, 1);
+        assert_eq!(results[0].snippet, "The launch plan is ready.");
+        assert!(results[0].has_attachments);
+
+        assert_eq!(db.search_messages("subject:budget", 0, 20).unwrap().len(), 1);
+        assert_eq!(db.search_messages("in:Archive", 0, 20).unwrap().len(), 1);
+        assert_eq!(db.search_messages("account:personal", 0, 20).unwrap().len(), 1);
+        assert_eq!(db.search_messages("roadmap", 0, 20).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reimport_updates_the_fts_index() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1]))
+            .unwrap();
+        assert_eq!(db.search_messages("Subject", 0, 20).unwrap().len(), 1);
+
+        let mut changed = snapshot("INBOX", 1, &[1]);
+        changed.headers[0].subject = "Renamed".into();
+        db.apply_snapshot("one", &changed).unwrap();
+
+        assert!(db.search_messages("Subject", 0, 20).unwrap().is_empty());
+        assert_eq!(db.search_messages("Renamed", 0, 20).unwrap().len(), 1);
     }
 }

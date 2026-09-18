@@ -162,6 +162,7 @@ where
                     // canonical date for this synchronization snapshot.
                     if let Some(internal_date) = fetch.internal_date.and_then(parse_internal_date) {
                         header.date = internal_date.to_rfc3339();
+                        header.sent_at = Some(internal_date.timestamp());
                     }
                     header.provider_message_id = attributes.iter().find_map(|attribute| {
                         if let AttributeValue::GmailMsgId(value) = attribute {

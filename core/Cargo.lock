@@ -1001,6 +1001,7 @@ dependencies = [
 name = "mail-db"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "mail-model",
  "rusqlite",
  "serde_json",

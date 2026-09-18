@@ -34,6 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     subject: format!("Offline message {uid}"),
                     sender: "Tern fixture <fixture@example.invalid>".into(),
                     date: "2026-09-18T09:30:00+00:00".into(),
+                    recipients: vec!["Reader <reader@example.invalid>".into()],
+                    sent_at: Some(1_789_723_800),
                     is_read: uid % 2 == 0,
                     is_starred: uid % 5 == 0,
                     ..RemoteHeader::default()

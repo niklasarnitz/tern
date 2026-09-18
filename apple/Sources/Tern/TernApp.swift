@@ -122,10 +122,14 @@ private struct MessageListView: View {
         Group {
             if store.isLoadingMessages, store.messages.isEmpty {
                 ProgressView("Loading messages…")
-            } else if store.mailboxes.isEmpty {
+            } else if store.mailboxes.isEmpty, !store.isSearching {
                 ContentUnavailableView("Select an Account", systemImage: "sidebar.left")
             } else if store.messages.isEmpty, !store.isLoadingMessages {
-                ContentUnavailableView("No Messages", systemImage: "tray")
+                if store.isSearching {
+                    ContentUnavailableView.search(text: store.activeSearchQuery ?? "")
+                } else {
+                    ContentUnavailableView("No Messages", systemImage: "tray")
+                }
             } else {
                 List(store.messages, id: \.id, selection: $store.selectedMessageID) { message in
                     MessageRow(message: message)
@@ -134,7 +138,22 @@ private struct MessageListView: View {
                 .listStyle(.inset)
             }
         }
-        .navigationTitle(store.selectedMailbox?.displayName ?? "Mail")
+        .navigationTitle(
+            store.isSearching ? "Search Results" : store.selectedMailbox?.displayName ?? "Mail"
+        )
+        .searchable(
+            text: $store.searchText,
+            placement: .toolbar,
+            prompt: "Search or use from:, before:, is:unread…"
+        )
+        .onSubmit(of: .search) {
+            Task { await store.submitSearch() }
+        }
+        .onChange(of: store.searchText) { _, query in
+            if query.isEmpty, store.isSearching {
+                Task { await store.clearSearch() }
+            }
+        }
         .toolbar {
             ToolbarItem {
                 Button {
@@ -177,7 +196,8 @@ private struct MessageListView: View {
     private var pageLabel: String {
         let first = store.messageOffset + 1
         let last = store.messageOffset + UInt32(store.messages.count)
-        return "Messages \(first)–\(last)"
+        let noun = store.isSearching ? "Results" : "Messages"
+        return "\(noun) \(first)–\(last)"
     }
 }
 
