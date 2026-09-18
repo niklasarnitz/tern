@@ -270,7 +270,8 @@ pub fn conversation_plain_text(text: &str, previous: &[String]) -> Option<String
             .iter()
             .map(|line| {
                 line.trim_start()
-                    .trim_start_matches('>')
+                    .strip_prefix('>')
+                    .unwrap_or_default()
                     .trim_start()
                     .to_owned()
             })
@@ -357,16 +358,52 @@ mod tests {
         );
         let parsed = parse_message(4, raw.as_bytes(), false, true);
         assert!(parsed.is_ok());
-        let Some(header) = parsed.ok() else { return };
-        let Some(content) = header.content else {
-            return;
-        };
-        assert!(content.plain_text.contains("plain body"));
-        assert!(content.html.contains("<h1>hello</h1>"));
-        assert!(!content.html.contains("script") && !content.html.contains("https://"));
-        assert_eq!(content.attachments.len(), 2);
-        assert_eq!(content.attachments[0].data, b"attached text");
-        assert_eq!(content.attachments[1].content_id.as_deref(), Some("pic"));
+        if let Ok(header) = parsed {
+            assert!(header.content.is_some());
+            if let Some(content) = header.content {
+                assert!(content.plain_text.contains("plain body"));
+                assert!(content.html.contains("<h1>hello</h1>"));
+                assert!(!content.html.contains("script") && !content.html.contains("https://"));
+                assert_eq!(content.attachments.len(), 2);
+                assert_eq!(content.attachments[0].data, b"attached text");
+                assert_eq!(content.attachments[1].content_id.as_deref(), Some("pic"));
+            }
+        }
+    }
+
+    #[test]
+    fn parse_message_preserves_forwarded_rfc822_attachment_and_links() {
+        let raw = concat!(
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n",
+            "--x\r\nContent-Type: text/html\r\n\r\n",
+            "<p><a href=\"https://example.test\">link</a></p><img src=\"relative.png\"><img src=\"cid:ok\">\r\n",
+            "--x\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment; filename=forwarded.eml\r\n\r\n",
+            "Subject: Forwarded\r\nContent-Type: text/plain\r\n\r\nforwarded body\r\n",
+            "--x--\r\n"
+        );
+        let parsed = parse_message(5, raw.as_bytes(), true, false);
+        assert!(parsed.is_ok());
+        if let Ok(header) = parsed {
+            assert!(header.content.is_some());
+            if let Some(content) = header.content {
+                assert!(content.html.contains("href=\"https://example.test\""));
+                assert!(!content.html.contains("relative.png"));
+                assert_eq!(content.attachments.len(), 1);
+                assert!(String::from_utf8_lossy(&content.attachments[0].data)
+                    .contains("forwarded body"));
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_body_budget_is_enforced_without_attachments() {
+        let repeated = "<b>x</b>".repeat(3_000_000);
+        let raw = format!("Content-Type: text/html\r\n\r\n{repeated}");
+        assert!(raw.len() < MAX_MESSAGE_BYTES);
+        assert!(matches!(
+            parse_message(6, raw.as_bytes(), false, false),
+            Err(MimeError::TooLarge)
+        ));
     }
 
     #[test]
