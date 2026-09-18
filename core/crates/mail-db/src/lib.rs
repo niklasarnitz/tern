@@ -680,7 +680,7 @@ where
                                SELECT 1 FROM mailbox_messages mm
                                WHERE mm.message_id = messages.id AND mm.mailbox_id <> ?4
                            )
-                           AND (?5 IS NULL OR content_json = ?5)
+                           AND (content_json IS NULL OR ?5 IS NULL OR content_json = ?5)
                          ORDER BY id LIMIT 1",
                             params![account_id, canonical, fingerprint, mailbox_id, content_json],
                             |row| row.get::<_, String>(0),
@@ -1788,6 +1788,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.list_threads(&mailbox.id, 0, 20).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cross_folder_body_enriches_header_only_logical_message() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let full = conversation_header(1, "enrich@example.test", &[]);
+        let mut header_only = full.clone();
+        header_only.content = None;
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![header_only],
+                },
+            )
+            .unwrap();
+        let mut sent_copy = full;
+        sent_copy.uid = 9;
+        let sent = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "Sent".into(),
+                    uid_validity: 2,
+                    uid_next: Some(10),
+                    headers: vec![sent_copy],
+                },
+            )
+            .unwrap();
+        let inbox_message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        let sent_message = db.list_messages(&sent.id, 0, 10).unwrap().remove(0);
+        assert_eq!(inbox_message.id, sent_message.id);
+        let detail = db.get_thread_message(&inbox_message.id).unwrap().unwrap();
+        assert_eq!(detail.memberships.len(), 2);
+        assert_eq!(detail.content.unwrap().plain_text, "body 1");
+    }
+
+    #[test]
+    fn conflicting_duplicate_body_threads_are_stable_on_repeat_snapshot() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let first = conversation_header(1, "stable-collision@example.test", &[]);
+        let mut second = first.clone();
+        second.uid = 2;
+        second.content.as_mut().unwrap().plain_text = "conflicting body".into();
+        let snapshot = MailboxSnapshot {
+            remote_name: "INBOX".into(),
+            uid_validity: 1,
+            uid_next: Some(3),
+            headers: vec![first, second],
+        };
+        let mailbox = db.apply_snapshot("one", &snapshot).unwrap();
+        let before = db
+            .list_threads(&mailbox.id, 0, 20)
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        db.apply_snapshot("one", &snapshot).unwrap();
+        let after = db
+            .list_threads(&mailbox.id, 0, 20)
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), 2);
+        assert_eq!(after, before);
     }
 
     #[test]
