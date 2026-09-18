@@ -12,11 +12,14 @@ The Rust build should place the generated UniFFI files in `Generated/`:
 Build the Rust library first, then run the app with a populated local database:
 
 ```sh
-cargo build --manifest-path ../core/Cargo.toml -p mail-core
-TERN_DATABASE=/path/to/mail.sqlite swift run
+cd ..
+TERN_DATABASE=/absolute/path/to/mail.sqlite devbox run macos
+
+# Build, lint, analyze, and test the actual Rust–Swift bridge:
+devbox run check-swift
 ```
 
 Without `TERN_DATABASE`, the app uses
 `~/Library/Application Support/Tern/mail.sqlite`. The message list requests a
-maximum of 100 summaries for the selected mailbox, so opening the app never
+maximum of 101 summaries (100 displayed plus one pagination probe), so opening the app never
 loads an entire mailbox into Swift memory.

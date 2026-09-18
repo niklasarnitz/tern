@@ -30,6 +30,7 @@ let package = Package(
             path: ".",
             exclude: [
                 "README.md",
+                "Tests",
                 "Generated/mail_coreFFI.h",
                 "Generated/mail_coreFFI.modulemap",
                 "Generated/mail_modelFFI.h",
@@ -51,6 +52,16 @@ let package = Package(
                 // Pass the archive by absolute path so SwiftPM cannot select a
                 // same-named dynamic library from the Rust target directory.
                 .unsafeFlags(["\(rustDebugDirectory)/libmail_core.a"], .when(platforms: [.macOS])),
+            ]
+        ),
+        .testTarget(
+            name: "TernTests",
+            dependencies: ["Tern"],
+            path: "Tests/TernTests",
+            swiftSettings: [
+                .unsafeFlags(["-warnings-as-errors"] + generatedModuleMapFlags + [
+                    "-Xcc", "-I\(generatedDirectory)",
+                ]),
             ]
         ),
     ],
