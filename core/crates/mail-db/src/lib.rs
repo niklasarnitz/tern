@@ -645,6 +645,24 @@ where
         })
         .transpose()?
         .flatten();
+    let queued_match = canonical_message_id
+        .as_deref()
+        .map(|canonical| {
+            transaction
+                .query_row(
+                    "SELECT msg.id FROM pending_operations op
+                     JOIN messages msg ON msg.id = op.message_id
+                     WHERE op.mailbox_id = ?1 AND op.state = 'waiting'
+                       AND msg.canonical_message_id = ?2
+                       AND msg.header_fingerprint = ?3
+                     ORDER BY op.id LIMIT 1",
+                    params![mailbox_id, canonical, fingerprint],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .transpose()?
+        .flatten();
     let strong_metadata =
         !header.sender.is_empty() && !header.date.is_empty() && header.sent_at.is_some();
     let generic_match =
@@ -677,6 +695,7 @@ where
     let message_row_id = membership_message_id
         .or(provider_match)
         .or(projected_match)
+        .or(queued_match)
         .or(generic_match)
         .unwrap_or_else(|| message_id(mailbox_id, uid_validity, header.uid));
     let thread_id = resolve_thread(
@@ -685,6 +704,7 @@ where
         &message_row_id,
         canonical_message_id.as_deref(),
         &fingerprint,
+        content_json.as_deref(),
         header,
     )?;
     transaction.execute(
@@ -777,6 +797,14 @@ where
         )?;
         return Ok(());
     }
+    let projected_flags = transaction
+        .query_row(
+            "SELECT is_read, is_starred FROM mailbox_messages
+             WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
+            params![mailbox_id, message_row_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
     transaction.execute(
         "DELETE FROM mailbox_messages
          WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
@@ -796,8 +824,8 @@ where
             message_row_id,
             i64::from(uid_validity),
             i64::from(header.uid),
-            i64::from(u8::from(header.is_read)),
-            i64::from(u8::from(header.is_starred)),
+            projected_flags.map_or_else(|| i64::from(u8::from(header.is_read)), |flags| flags.0),
+            projected_flags.map_or_else(|| i64::from(u8::from(header.is_starred)), |flags| flags.1),
         ],
     )?;
     reapply_membership_overlays(
@@ -818,6 +846,7 @@ fn resolve_thread<T>(
     message_row_id: &str,
     canonical_id: Option<&str>,
     fingerprint: &str,
+    content_json: Option<&str>,
     header: &RemoteHeader,
 ) -> Result<String>
 where
@@ -837,10 +866,12 @@ where
             transaction.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM messages
-                     WHERE account_id = ?1 AND canonical_message_id = ?2
-                       AND id <> ?3 AND header_fingerprint <> ?4
+                     WHERE account_id = ?1 AND canonical_message_id = ?2 AND id <> ?3
+                       AND (header_fingerprint <> ?4
+                            OR (?5 IS NOT NULL AND content_json IS NOT NULL
+                                AND content_json <> ?5))
                  )",
-                params![account_id, id, message_row_id, fingerprint],
+                params![account_id, id, message_row_id, fingerprint, content_json],
                 |row| Ok(row.get::<_, i64>(0)? != 0),
             )
         })
@@ -1654,6 +1685,252 @@ mod tests {
             .content
             .is_some());
         assert_eq!(db.previous_plain_texts(&last.id, 200).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn projected_actions_wait_then_bind_through_a_second_move() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let original = conversation_header(1, "move-chain@example.test", &[]);
+        let inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![original.clone()],
+                },
+            )
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 2, &[]))
+            .unwrap();
+        let trash = db
+            .apply_snapshot("one", &snapshot("Trash", 3, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        db.mutate_message(&message.id, &inbox.id, MailAction::Move, Some(&archive.id))
+            .unwrap();
+        db.mutate_message(&message.id, &archive.id, MailAction::MarkRead, None)
+            .unwrap();
+        db.mutate_message(&message.id, &archive.id, MailAction::Move, Some(&trash.id))
+            .unwrap();
+        let queued = db.pending_operations("one").unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|operation| operation.can_replay)
+                .count(),
+            1
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|operation| !operation.can_replay)
+                .count(),
+            2
+        );
+        assert!(db.list_messages(&archive.id, 0, 10).unwrap().is_empty());
+        assert!(db.list_messages(&trash.id, 0, 10).unwrap()[0].is_read);
+
+        let mut archive_confirmation = original.clone();
+        archive_confirmation.uid = 20;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Archive".into(),
+                uid_validity: 2,
+                uid_next: Some(21),
+                headers: vec![archive_confirmation],
+            },
+        )
+        .unwrap();
+        let queued = db.pending_operations("one").unwrap();
+        assert!(queued.iter().all(|operation| operation.can_replay));
+        assert!(db.list_messages(&archive.id, 0, 10).unwrap().is_empty());
+
+        let mut trash_confirmation = original;
+        trash_confirmation.uid = 30;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "Trash".into(),
+                uid_validity: 3,
+                uid_next: Some(31),
+                headers: vec![trash_confirmation],
+            },
+        )
+        .unwrap();
+        let messages = db.list_messages(&trash.id, 0, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].remote_uid, 30);
+        assert!(messages[0].is_read);
+    }
+
+    #[test]
+    fn conflicting_bodies_with_same_metadata_do_not_share_a_thread() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let first = conversation_header(1, "collision@example.test", &[]);
+        let mut second = first.clone();
+        second.uid = 2;
+        second.content.as_mut().unwrap().plain_text = "different body".into();
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(3),
+                    headers: vec![first, second],
+                },
+            )
+            .unwrap();
+        assert_eq!(db.list_threads(&mailbox.id, 0, 20).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn long_conversation_pages_across_bounded_snapshots() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let make_headers = |range: std::ops::RangeInclusive<u32>| {
+            range
+                .map(|uid| {
+                    let id = format!("long-{uid}@example.test");
+                    let parent = (uid > 1).then(|| format!("long-{}@example.test", uid - 1));
+                    let references = parent.as_deref().into_iter().collect::<Vec<_>>();
+                    conversation_header(uid, &id, &references)
+                })
+                .collect()
+        };
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(201),
+                    headers: make_headers(1..=200),
+                },
+            )
+            .unwrap();
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(251),
+                headers: make_headers(201..=250),
+            },
+        )
+        .unwrap();
+        let thread = db.list_threads(&mailbox.id, 0, 10).unwrap().remove(0);
+        assert_eq!(thread.message_count, 250);
+        assert_eq!(
+            db.list_thread_messages(&thread.id, 0, 10_000)
+                .unwrap()
+                .len(),
+            200
+        );
+        assert_eq!(
+            db.list_thread_messages(&thread.id, 200, 200).unwrap().len(),
+            50
+        );
+    }
+
+    #[test]
+    fn provider_identity_is_account_scoped_and_deduplicates_labels() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.upsert_account(&account("two")).unwrap();
+        let mut provider = conversation_header(1, "provider@example.test", &[]);
+        provider.provider_message_id = Some("provider-message".into());
+        provider.provider_thread_id = Some("provider-thread".into());
+        let one_inbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![provider.clone()],
+                },
+            )
+            .unwrap();
+        let mut label_copy = provider.clone();
+        label_copy.uid = 7;
+        let one_label = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "Label".into(),
+                    uid_validity: 2,
+                    uid_next: Some(8),
+                    headers: vec![label_copy],
+                },
+            )
+            .unwrap();
+        let two_inbox = db
+            .apply_snapshot(
+                "two",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(2),
+                    headers: vec![provider],
+                },
+            )
+            .unwrap();
+        let one = db.list_messages(&one_inbox.id, 0, 10).unwrap().remove(0);
+        let label = db.list_messages(&one_label.id, 0, 10).unwrap().remove(0);
+        let two = db.list_messages(&two_inbox.id, 0, 10).unwrap().remove(0);
+        assert_eq!(one.id, label.id);
+        assert_ne!(one.id, two.id);
+        assert_ne!(
+            db.list_threads(&one_inbox.id, 0, 10).unwrap()[0].id,
+            db.list_threads(&two_inbox.id, 0, 10).unwrap()[0].id
+        );
+    }
+
+    #[test]
+    fn same_subject_stays_separate_and_header_refresh_keeps_body() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let first = conversation_header(1, "first@example.test", &[]);
+        let mut second = conversation_header(2, "second@example.test", &[]);
+        second.subject.clone_from(&first.subject);
+        let mailbox = db
+            .apply_snapshot(
+                "one",
+                &MailboxSnapshot {
+                    remote_name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: Some(3),
+                    headers: vec![first.clone(), second],
+                },
+            )
+            .unwrap();
+        assert_eq!(db.list_threads(&mailbox.id, 0, 20).unwrap().len(), 2);
+        let message = db.list_messages(&mailbox.id, 0, 20).unwrap().remove(1);
+        let mut header_only = first;
+        header_only.content = None;
+        db.apply_snapshot(
+            "one",
+            &MailboxSnapshot {
+                remote_name: "INBOX".into(),
+                uid_validity: 1,
+                uid_next: Some(3),
+                headers: vec![header_only],
+            },
+        )
+        .unwrap();
+        assert!(db
+            .get_thread_message(&message.id)
+            .unwrap()
+            .unwrap()
+            .content
+            .is_some());
     }
 
     #[test]

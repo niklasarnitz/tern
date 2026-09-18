@@ -154,7 +154,7 @@ fn mutate_one(
                     mm.local_only
              FROM mailbox_messages mm
              JOIN mailboxes mb ON mb.id = mm.mailbox_id
-             WHERE mm.message_id = ?1 AND mm.mailbox_id = ?2 AND mm.local_only = 0
+             WHERE mm.message_id = ?1 AND mm.mailbox_id = ?2
              ORDER BY mm.remote_uid LIMIT 1",
             params![message_id, mailbox_id],
             |row| {
