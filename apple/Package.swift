@@ -30,7 +30,6 @@ let package = Package(
             path: ".",
             exclude: [
                 "README.md",
-                "Generated/.gitkeep",
                 "Generated/mail_coreFFI.h",
                 "Generated/mail_coreFFI.modulemap",
                 "Generated/mail_modelFFI.h",

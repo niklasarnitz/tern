@@ -45,7 +45,6 @@ final class MailStore: ObservableObject {
     private var core: MailCoreActor?
     private var started = false
     private var requestGeneration: UInt64 = 0
-    private var ignoredSidebarSelection: SidebarItem?
 
     let messagePageSize: UInt32 = 100
     @Published private(set) var messageOffset: UInt32 = 0
@@ -96,37 +95,62 @@ final class MailStore: ObservableObject {
 
     func refresh() async {
         guard core != nil else { return }
+        requestGeneration &+= 1
+        let generation = requestGeneration
         isLoading = true
-        errorMessage = nil
-        if let accountID = selectedAccountID, let account = accounts.first(where: { $0.id == accountID }) {
-            await loadMailboxes(for: account)
-        } else {
-            await loadAccounts()
+        defer {
+            if generation == requestGeneration {
+                isLoading = false
+            }
         }
-        isLoading = false
+        errorMessage = nil
+        await loadAccounts()
     }
 
-    func selectAccount(_ account: Account) async {
-        guard selectedAccountID != account.id || mailboxes.isEmpty else { return }
-        guard !isLoadingMailboxes else { return }
-        requestGeneration &+= 1
+    func selectAccount(_ account: Account, invalidateRequest: Bool = true) async {
+        guard selectedAccountID != account.id else { return }
+        if invalidateRequest {
+            requestGeneration &+= 1
+        }
+        let generation = requestGeneration
+        isLoading = true
+        defer {
+            if generation == requestGeneration {
+                isLoading = false
+            }
+        }
         selectedAccountID = account.id
         selectedMailboxID = nil
         selectedMessageID = nil
         messageOffset = 0
         hasNextMessagePage = false
+        isLoadingAccounts = false
+        isLoadingMailboxes = false
+        isLoadingMessages = false
         messages = []
         setSidebarSelection(.account(account.id))
         await loadMailboxes(for: account)
     }
 
-    func selectMailbox(_ mailbox: Mailbox) async {
-        guard selectedMailboxID != mailbox.id || messages.isEmpty else { return }
-        requestGeneration &+= 1
+    func selectMailbox(_ mailbox: Mailbox, invalidateRequest: Bool = true) async {
+        guard selectedMailboxID != mailbox.id else { return }
+        if invalidateRequest {
+            requestGeneration &+= 1
+        }
+        let generation = requestGeneration
+        isLoading = true
+        defer {
+            if generation == requestGeneration {
+                isLoading = false
+            }
+        }
         selectedMailboxID = mailbox.id
         selectedMessageID = nil
         messageOffset = 0
         hasNextMessagePage = false
+        isLoadingAccounts = false
+        isLoadingMailboxes = false
+        isLoadingMessages = false
         messages = []
         setSidebarSelection(.mailbox(mailbox.id))
         guard let core else { return }
@@ -135,10 +159,6 @@ final class MailStore: ObservableObject {
 
     func handleSidebarSelection(_ item: SidebarItem?) async {
         guard let item else { return }
-        if ignoredSidebarSelection == item {
-            ignoredSidebarSelection = nil
-            return
-        }
         switch item {
         case let .account(accountID):
             if let account = accounts.first(where: { $0.id == accountID }) {
@@ -168,11 +188,11 @@ final class MailStore: ObservableObject {
         guard let core else { return }
         let generation = requestGeneration
         isLoadingAccounts = true
-        defer { isLoadingAccounts = false }
         do {
             let loadedAccounts = try await core.listAccounts()
             guard generation == requestGeneration else { return }
             accounts = loadedAccounts
+            isLoadingAccounts = false
             guard let account = accounts.first(where: { $0.id == selectedAccountID }) ?? accounts.first else {
                 selectedAccountID = nil
                 selectedSidebarItem = nil
@@ -180,13 +200,16 @@ final class MailStore: ObservableObject {
                 messages = []
                 return
             }
-            if selectedAccountID == nil || mailboxes.isEmpty {
-                await selectAccount(account)
+            if selectedAccountID != account.id {
+                await selectAccount(account, invalidateRequest: false)
             } else {
                 await loadMailboxes(for: account)
             }
         } catch {
-            errorMessage = Self.message(for: error)
+            if generation == requestGeneration {
+                isLoadingAccounts = false
+                errorMessage = Self.message(for: error)
+            }
         }
     }
 
@@ -194,50 +217,57 @@ final class MailStore: ObservableObject {
         guard let core else { return }
         let generation = requestGeneration
         isLoadingMailboxes = true
-        defer { isLoadingMailboxes = false }
         do {
             let loadedMailboxes = try await core.listMailboxes(accountID: account.id)
             guard generation == requestGeneration, selectedAccountID == account.id else { return }
             mailboxes = loadedMailboxes
+            isLoadingMailboxes = false
             if let selectedMailboxID, let selected = mailboxes.first(where: { $0.id == selectedMailboxID }) {
                 setSidebarSelection(.mailbox(selected.id))
                 await loadMessages(mailboxID: selected.id, offset: messageOffset, using: core)
             } else if let first = mailboxes.first {
-                await selectMailbox(first)
+                await selectMailbox(first, invalidateRequest: false)
             } else {
                 selectedMailboxID = nil
                 selectedSidebarItem = .account(account.id)
                 messages = []
             }
         } catch {
-            errorMessage = Self.message(for: error)
+            if generation == requestGeneration {
+                isLoadingMailboxes = false
+                errorMessage = Self.message(for: error)
+            }
         }
     }
 
     private func loadMessages(mailboxID: String, offset: UInt32, using core: MailCoreActor) async {
         let generation = requestGeneration
         isLoadingMessages = true
-        defer { isLoadingMessages = false }
+        defer {
+            if generation == requestGeneration, selectedMailboxID == mailboxID {
+                isLoadingMessages = false
+            }
+        }
         do {
             // Every request is deliberately bounded. Paging replaces the
             // current window rather than accumulating an entire mailbox.
             let loadedMessages = try await core.listMessages(
                 mailboxID: mailboxID,
                 offset: offset,
-                limit: messagePageSize
+                limit: messagePageSize + 1
             )
             guard generation == requestGeneration, selectedMailboxID == mailboxID else { return }
-            messages = loadedMessages
+            messages = Array(loadedMessages.prefix(Int(messagePageSize)))
             messageOffset = offset
-            hasNextMessagePage = loadedMessages.count == Int(messagePageSize)
+            hasNextMessagePage = loadedMessages.count > Int(messagePageSize)
         } catch {
-            errorMessage = Self.message(for: error)
+            if generation == requestGeneration {
+                errorMessage = Self.message(for: error)
+            }
         }
     }
 
     private func setSidebarSelection(_ item: SidebarItem) {
-        guard selectedSidebarItem != item else { return }
-        ignoredSidebarSelection = item
         selectedSidebarItem = item
     }
 
