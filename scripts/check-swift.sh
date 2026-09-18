@@ -11,6 +11,6 @@ trap 'rm -rf "$fixture_directory"' EXIT
 cargo run --manifest-path core/Cargo.toml -p mail-core --example seed_cache --locked -- "$fixture_directory/mail.sqlite"
 # Analysis needs actual compiler invocations, so do not reuse an incremental build log.
 swift package --package-path apple clean
-TERN_TEST_DATABASE="$fixture_directory/mail.sqlite" \
+TERN_TEST_DATABASE="$fixture_directory/mail.sqlite" TERN_DATABASE="$fixture_directory/mail.sqlite" \
   swift test --package-path apple -v -Xswiftc -warnings-as-errors 2>&1 | tee .devbox/checks/swift-build.log
 swiftlint analyze --strict --config .swiftlint.yml --compiler-log-path .devbox/checks/swift-build.log

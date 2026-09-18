@@ -28,4 +28,24 @@ final class OfflineBridgeTests: XCTestCase {
         let beyondEnd = try reopened.listMessages(mailboxId: mailboxID, offset: 105, limit: 100)
         XCTAssertTrue(beyondEnd.isEmpty)
     }
+
+    @MainActor
+    func testNativeStorePagesWithoutAccumulatingMessages() async {
+        let store = MailStore()
+        await store.start()
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(store.messages.count, 100)
+        XCTAssertTrue(store.hasNextMessagePage)
+        await store.nextMessagePage()
+        XCTAssertEqual(store.messages.count, 5)
+        XCTAssertEqual(store.messageOffset, 100)
+        XCTAssertFalse(store.hasNextMessagePage)
+        await store.previousMessagePage()
+        XCTAssertEqual(store.messages.count, 100)
+        XCTAssertEqual(store.messageOffset, 0)
+        await store.refresh()
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(store.accounts.count, 1)
+        XCTAssertEqual(store.messages.count, 100)
+    }
 }
