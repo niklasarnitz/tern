@@ -52,9 +52,10 @@ The first macOS build needs network access to download build dependencies; once 
 - `mail-imap`, `mail-mime`: secure IMAP header fetch and MIME normalization
 - `mail-sync`: credential abstraction and import orchestration
 - `mail-core`: application API, UniFFI and development CLI
+- `mail-push-service`: optional content-free APNs wake relay
 - `apple`: native macOS SwiftUI cache viewer
 
-See [architecture and milestones](docs/architecture.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
+See [architecture and milestones](docs/architecture.md), [push service design and deployment contract](docs/push-service.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
 
 Still ahead: all-folder sync, incremental updates and events, message bodies/HTML, offline mutations, SMTP/compose, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.
 

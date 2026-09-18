@@ -11,6 +11,8 @@ Validated against upstream documentation and the repository build. `core/Cargo.l
 | SQLite | rusqlite with bundled SQLite | Small synchronous transaction boundary, consistent SQLite distribution, easy local tests. Reads execute away from Swift's main actor. |
 | Bridge | UniFFI | Generated application records and Swift calls; no protocol objects leak across FFI. |
 | Diagnostics | tracing-subscriber | CLI logging foundation; never log credentials, raw protocol traffic or message contents. |
+| Push HTTP service | Axum | Small typed wake-relay surface with explicit body limits; independently deployed and not linked into the client. |
+| Apple push transport | Hyper, rustls and ring | Token-authenticated APNs HTTP/2 with the same current TLS stack as IMAP and no OpenSSL runtime dependency. Notifications contain only an opaque subscription ID. |
 
 References:
 
@@ -19,6 +21,8 @@ References:
 - [UniFFI](https://mozilla.github.io/uniffi-rs/latest/)
 - [mail-parser](https://docs.rs/mail-parser/latest/mail_parser/)
 - [Rustls](https://docs.rs/rustls/latest/rustls/)
+- [Axum](https://docs.rs/axum/latest/axum/)
+- [Apple APNs provider API](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns)
 
 Do not infer Gmail/iCloud compatibility from a successful generic protocol build. Live provider verification needs test credentials and Google OAuth setup. SMTP selection is deliberately deferred until the sending slice; evaluate lettre and mail-builder then, including TLS, OAuth and attachment streaming.
 

@@ -30,7 +30,9 @@ Credentials are requested through a Rust `CredentialProvider`. The prototype CLI
 6. Gmail OAuth and iCloud onboarding: browser authorization, Keychain refresh tokens, provider discovery, diagnostics, Gmail label identity. Gmail/iCloud integration tests require authorized test accounts.
 7. Hardening: 10 / 10,000 / 100,000+ messages; slow/offline/changing networks; disconnects; expired tokens; invalid certificates; UIDVALIDITY changes; duplicate IDs; malformed MIME; large attachments; multiple accounts. Measure launch, scrolling, RAM, CPU, DB size, sync time and battery.
 
-Search can follow MVP using FTS5; threading initially remains a flat list. Deferred: Exchange/Graph/JMAP, calendars/contacts, encryption, rules, smart mailboxes, unified inbox, snooze/scheduling, AI, plugins, Linux UI, advanced previews and push infrastructure.
+Search can follow MVP using FTS5; threading initially remains a flat list. Deferred: Exchange/Graph/JMAP, calendars/contacts, encryption, rules, smart mailboxes, unified inbox, snooze/scheduling, AI, plugins, Linux UI and advanced previews.
+
+An optional [push-trigger service](push-service.md) is implemented as an independently deployed wake relay. It stores only an opaque subscription-to-APNs-token route and never receives provider credentials, mailbox state, message metadata or message content. Provider adapters reduce native webhook events to an empty trigger; the device still synchronizes directly with the provider. Device registration and background handling remain gated on the future signed iOS target and incremental account-sync API.
 
 ## Public MVP acceptance
 
