@@ -516,6 +516,7 @@ mod tests {
                     date: format!("2026-01-{uid:02}"),
                     is_read: uid % 2 == 0,
                     is_starred: uid % 3 == 0,
+                    ..RemoteHeader::default()
                 })
                 .collect(),
         }
