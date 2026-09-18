@@ -8,6 +8,8 @@ The first vertical slice imports up to 100 recent Inbox headers over verified im
 
 Crate dependencies flow from `mail-core` (application facade and CLI) through `mail-sync` (orchestration) to `mail-imap` (protocol) and `mail-db` (persistence). `mail-mime` normalizes headers through an existing MIME parser. `mail-model` carries the shared records. Add a real `mail-smtp` crate when SMTP is implemented, rather than an empty placeholder.
 
+`mail-autoconfig` owns account discovery. It checks explicit overrides, known provider presets, HTTPS domain autoconfig, RFC 6186 DNS SRV records, and conservative hostname guesses in that order. Discovery probes verified implicit TLS and the IMAP greeting without authenticating. Unsupported STARTTLS discoveries are diagnostic only until the IMAP transport supports negotiated TLS without downgrade.
+
 Database decisions:
 
 - Account configuration stores credential references, never passwords or OAuth tokens.

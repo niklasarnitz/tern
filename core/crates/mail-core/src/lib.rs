@@ -1,12 +1,36 @@
 //! Stable application boundary exposed to native frontends via `UniFFI`.
 use mail_db::Database;
-use mail_model::{Account, Mailbox, MessageSummary, WidgetSnapshot};
+use mail_model::{
+    Account, AccountDiscovery, DiscoveryOverrides, Mailbox, MessageSummary, WidgetSnapshot,
+};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MailError {
     #[error("Local mail storage: {message}")]
     Storage { message: String },
+    #[error("Account discovery: {message}")]
+    Discovery { message: String },
+}
+
+/// Discover an implicit-TLS IMAP configuration without authenticating.
+///
+/// Manual values take precedence over provider presets, domain autoconfig,
+/// DNS SRV records, and conservative hostname guesses.
+///
+/// # Errors
+/// Returns a sanitized error when the email address or override is invalid or
+/// the platform cannot initialize discovery.
+#[uniffi::export]
+pub async fn discover_account(
+    email: String,
+    overrides: DiscoveryOverrides,
+) -> Result<AccountDiscovery, MailError> {
+    mail_autoconfig::discover(&email, &overrides)
+        .await
+        .map_err(|error| MailError::Discovery {
+            message: error.to_string(),
+        })
 }
 fn storage(error: impl std::fmt::Display) -> MailError {
     MailError::Storage {

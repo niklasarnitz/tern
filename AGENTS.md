@@ -10,6 +10,7 @@ The implemented slice is a CLI import of recent Inbox headers into SQLite plus a
 
 ```text
 Apple SwiftUI -> UniFFI -> mail-core -> mail-db -> SQLite
+                         -> mail-autoconfig -> HTTPS / DNS / TLS probe
 Development CLI -> mail-sync -> mail-imap -> mail-mime
                             -> mail-db
 mail-model supplies shared records across these boundaries.
@@ -18,6 +19,7 @@ mail-model supplies shared records across these boundaries.
 | Area | Ownership |
 | --- | --- |
 | `core/crates/mail-model` | Portable records and exported value types |
+| `core/crates/mail-autoconfig` | Provider presets, domain autoconfig, DNS SRV, safe fallbacks and unauthenticated connection diagnostics |
 | `core/crates/mail-db` | Schema migrations, persistence, identities and indexed pages |
 | `core/crates/mail-imap` | Verified TLS, IMAP commands and typed protocol responses |
 | `core/crates/mail-mime` | Normalization through an existing MIME parser |

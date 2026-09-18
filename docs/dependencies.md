@@ -13,6 +13,7 @@ Validated against upstream documentation and the repository build. `core/Cargo.l
 | Diagnostics | tracing-subscriber | CLI logging foundation; never log credentials, raw protocol traffic or message contents. |
 | Push HTTP service | Axum | Small typed wake-relay surface with explicit body limits; independently deployed and not linked into the client. |
 | Apple push transport | Hyper, rustls and ring | Token-authenticated APNs HTTP/2 with the same current TLS stack as IMAP and no OpenSSL runtime dependency. Notifications contain only an opaque subscription ID. |
+| Account discovery | hickory-resolver, reqwest, quick-xml | RFC 6186 SRV lookup, HTTPS-only domain autoconfig, and bounded parsing of Thunderbird-compatible XML. Discovery does not authenticate. |
 
 Network operations have bounded connect and command timeouts. Socket, DNS and
 IDLE disconnects retry on a fresh connection with capped exponential backoff
@@ -30,6 +31,8 @@ References:
 - [Rustls](https://docs.rs/rustls/latest/rustls/)
 - [Axum](https://docs.rs/axum/latest/axum/)
 - [Apple APNs provider API](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns)
+- [RFC 6186](https://www.rfc-editor.org/rfc/rfc6186)
+- [Thunderbird autoconfiguration format](https://developer.mozilla.org/en-US/docs/Mozilla/Thunderbird/Autoconfiguration/FileFormat/HowTo)
 
 Do not infer Gmail/iCloud compatibility from a successful generic protocol build. Live provider verification needs test credentials and Google OAuth setup. SMTP selection is deliberately deferred until the sending slice; evaluate lettre and mail-builder then, including TLS, OAuth and attachment streaming.
 

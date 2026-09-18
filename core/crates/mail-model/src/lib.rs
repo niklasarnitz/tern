@@ -11,6 +11,64 @@ pub struct Account {
     pub username: String,
     pub credential_ref: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum DiscoverySource {
+    Manual,
+    ProviderPreset,
+    DomainAutoconfig,
+    DnsSrv,
+    HostGuess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum AuthenticationKind {
+    Password,
+    OAuth2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct MailServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub source: DiscoverySource,
+    pub authentication: AuthenticationKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DiscoveryOverrides {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum DiagnosticStatus {
+    Available,
+    Unreachable,
+    TlsFailed,
+    InvalidResponse,
+    NotFound,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ConnectionDiagnostic {
+    pub source: DiscoverySource,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub status: DiagnosticStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AccountDiscovery {
+    pub email: String,
+    pub recommended: Option<MailServerConfig>,
+    pub candidates: Vec<MailServerConfig>,
+    pub diagnostics: Vec<ConnectionDiagnostic>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
 pub struct Mailbox {
     pub id: String,
