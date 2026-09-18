@@ -48,6 +48,22 @@ pub struct MessageContent {
     pub plain_text: String,
     pub html: String,
     pub attachments: Vec<Attachment>,
+    pub delivery_report: Option<DeliveryReport>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DeliveryReport {
+    pub reporting_mta: String,
+    pub recipients: Vec<DeliveryRecipient>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DeliveryRecipient {
+    pub recipient: String,
+    pub action: String,
+    pub status_code: String,
+    pub status_description: String,
+    pub diagnostic: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
