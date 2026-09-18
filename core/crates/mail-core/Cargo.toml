@@ -6,6 +6,7 @@ license.workspace = true
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
+mail-autoconfig.workspace = true
 mail-model.workspace = true
 mail-db.workspace = true
 mail-sync.workspace = true

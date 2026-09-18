@@ -43,3 +43,7 @@ identifier_name:
   min_length: 2
   excluded:
     - id
+
+# Match SwiftFormat's required trailing commas in multiline collections.
+trailing_comma:
+  mandatory_comma: true

@@ -16,15 +16,40 @@ impl Database {
         destination_mailbox_id: Option<&str>,
     ) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        mutate_one(
+        let _operation_id = mutate_one(
             &transaction,
             message_id,
             mailbox_id,
             action,
             destination_mailbox_id,
+            0,
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Optimistically move a message and keep the operation locally undoable.
+    ///
+    /// # Errors
+    /// Returns an error if either membership is unavailable or the transaction fails.
+    pub fn queue_move(
+        &self,
+        mailbox_id: &str,
+        message_id: &str,
+        destination_mailbox_id: &str,
+        undo_deadline_ms: i64,
+    ) -> Result<String> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let operation_id = mutate_one(
+            &transaction,
+            message_id,
+            mailbox_id,
+            MailAction::Move,
+            Some(destination_mailbox_id),
+            undo_deadline_ms,
+        )?;
+        transaction.commit()?;
+        Ok(operation_id)
     }
 
     /// Applies a mutation only to this thread's memberships in the selected mailbox.
@@ -58,12 +83,13 @@ impl Database {
             });
         }
         for id in ids {
-            mutate_one(
+            let _operation_id = mutate_one(
                 &transaction,
                 &id,
                 mailbox_id,
                 action,
                 destination_mailbox_id,
+                0,
             )?;
         }
         transaction.commit()?;
@@ -103,6 +129,113 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(DatabaseError::from)
+    }
+
+    /// Claims new operations whose local undo window has elapsed.
+    ///
+    /// Failed operations are intentionally excluded: a lost server response can
+    /// make a non-idempotent move ambiguous, so reconciliation must decide whether
+    /// replay is safe.
+    ///
+    /// # Errors
+    /// Returns an error when `SQLite` cannot read or update the queue.
+    pub fn claim_due_operations(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<PendingOperation>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT id, account_id, mailbox_id, remote_name, message_id, uid_validity,
+                    remote_uid, action, destination_mailbox_id, destination_remote_name,
+                    retry_count, last_error
+             FROM pending_operations
+             WHERE account_id = ?1 AND state = 'pending'
+               AND undo_deadline_ms <= ?2
+             ORDER BY id",
+        )?;
+        let operations = statement
+            .query_map(params![account_id, now_ms], operation_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for operation in &operations {
+            transaction.execute(
+                "UPDATE pending_operations SET state = 'applying' WHERE id = ?1",
+                [&operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(operations)
+    }
+
+    /// Reverses an optimistic move before server replay claims it.
+    ///
+    /// # Errors
+    /// Returns an error when `SQLite` cannot restore the source membership.
+    pub fn undo_operation(&self, id: &str) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let operation = transaction
+            .query_row(
+                "SELECT mailbox_id, message_id, uid_validity, remote_uid,
+                        destination_mailbox_id
+                 FROM pending_operations
+                 WHERE id = ?1 AND action = 'move'
+                   AND state IN ('pending', 'waiting')",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((mailbox_id, message_id, uid_validity, remote_uid, destination_id)) = operation
+        else {
+            return Ok(false);
+        };
+        let flags = transaction
+            .query_row(
+                "SELECT is_read, is_starred FROM mailbox_messages
+                 WHERE mailbox_id = ?1 AND message_id = ?2",
+                params![destination_id, message_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0));
+        transaction.execute(
+            "DELETE FROM mailbox_messages
+             WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
+            params![destination_id, message_id],
+        )?;
+        let local_only = remote_uid == 0;
+        let restored_uid = if local_only {
+            -id.parse::<i64>()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+        } else {
+            remote_uid
+        };
+        transaction.execute(
+            "INSERT OR IGNORE INTO mailbox_messages
+                (mailbox_id, message_id, uid_validity, remote_uid,
+                 is_read, is_starred, local_only)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                mailbox_id,
+                message_id,
+                uid_validity,
+                restored_uid,
+                flags.0,
+                flags.1,
+                i64::from(u8::from(local_only)),
+            ],
+        )?;
+        transaction.execute("DELETE FROM pending_operations WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Marks a replay as acknowledged while retaining reconciliation evidence.
@@ -245,7 +378,7 @@ impl Database {
         Ok(())
     }
 
-    /// Records a replay failure durably and leaves the operation retryable.
+    /// Records a replay failure durably for later reconciliation.
     ///
     /// # Errors
     /// Returns an error when the operation is absent or `SQLite` rejects the update.
@@ -272,7 +405,8 @@ fn mutate_one(
     mailbox_id: &str,
     action: MailAction,
     destination_mailbox_id: Option<&str>,
-) -> Result<()> {
+    undo_deadline_ms: i64,
+) -> Result<String> {
     let membership = transaction
         .query_row(
             "SELECT mb.account_id, mb.remote_name, mm.uid_validity, mm.remote_uid,
@@ -323,8 +457,8 @@ fn mutate_one(
     transaction.execute(
         "INSERT INTO pending_operations
             (account_id, mailbox_id, remote_name, message_id, uid_validity, remote_uid,
-             action, destination_mailbox_id, destination_remote_name, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             action, destination_mailbox_id, destination_remote_name, state, undo_deadline_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             membership.0,
             mailbox_id,
@@ -336,8 +470,10 @@ fn mutate_one(
             destination.as_ref().map(|value| &value.0),
             destination.as_ref().map(|value| &value.1),
             if membership.4 { "waiting" } else { "pending" },
+            undo_deadline_ms,
         ],
     )?;
+    let operation_id = transaction.last_insert_rowid();
     match action {
         MailAction::MarkRead => update_flag(transaction, mailbox_id, message_id, "is_read", true)?,
         MailAction::MarkUnread => {
@@ -350,7 +486,7 @@ fn mutate_one(
         MailAction::Move => {
             let (destination_id, _, destination_validity) =
                 destination.ok_or(DatabaseError::InvalidMoveDestination)?;
-            let validity = destination_validity.ok_or(DatabaseError::InvalidMoveDestination)?;
+            let validity = destination_validity.unwrap_or(0);
             let flags = transaction.query_row(
                 "SELECT is_read, is_starred FROM mailbox_messages
                  WHERE mailbox_id = ?1 AND message_id = ?2",
@@ -368,7 +504,7 @@ fn mutate_one(
                 |row| Ok(row.get::<_, i64>(0)? != 0),
             )?;
             if !destination_has_message {
-                let projected_uid = -transaction.last_insert_rowid();
+                let projected_uid = -operation_id;
                 transaction.execute(
                     "INSERT INTO mailbox_messages
                     (mailbox_id, message_id, uid_validity, remote_uid,
@@ -386,7 +522,26 @@ fn mutate_one(
             }
         }
     }
-    Ok(())
+    Ok(operation_id.to_string())
+}
+
+fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOperation> {
+    let action = action_from_db(&row.get::<_, String>(7)?)?;
+    Ok(PendingOperation {
+        id: row.get::<_, i64>(0)?.to_string(),
+        account_id: row.get(1)?,
+        mailbox_id: row.get(2)?,
+        remote_name: row.get(3)?,
+        message_id: row.get(4)?,
+        uid_validity: crate::u32_from_sql(row.get::<_, i64>(5)?, 5)?,
+        remote_uid: crate::u32_from_sql(row.get::<_, i64>(6)?, 6)?,
+        action,
+        destination_mailbox_id: row.get(8)?,
+        destination_remote_name: row.get(9)?,
+        retry_count: crate::u32_from_sql(row.get::<_, i64>(10)?, 10)?,
+        last_error: row.get(11)?,
+        can_replay: true,
+    })
 }
 
 fn mark_move_stale(transaction: &Transaction<'_>, id: &str, reason: &str) -> Result<()> {

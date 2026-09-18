@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use mail_db::Database;
-use mail_model::Account;
+use mail_model::{Account, DiscoveryOverrides};
 use mail_sync::{CredentialProvider, SyncError};
 use std::{error::Error, path::PathBuf};
 
@@ -17,6 +17,19 @@ enum Command {
     /// Add configuration from JSON. Never put a password in the JSON file.
     AddAccount {
         config: PathBuf,
+    },
+    /// Discover and diagnose implicit-TLS IMAP settings without authenticating.
+    DiscoverAccount {
+        email: String,
+        /// Use this server instead of automatic discovery.
+        #[arg(long)]
+        imap_host: Option<String>,
+        /// Override the discovered implicit-TLS port.
+        #[arg(long)]
+        imap_port: Option<u16>,
+        /// Override the discovered login name.
+        #[arg(long)]
+        username: Option<String>,
     },
     Accounts,
     Mailboxes {
@@ -50,9 +63,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let db = Database::open(cli.database.to_str().ok_or("Invalid database path")?)?;
+    let database_path = cli.database.to_str().ok_or("Invalid database path")?;
     match cli.command {
         Command::AddAccount { config } => {
+            let db = Database::open(database_path)?;
             let account: Account = serde_json::from_slice(&std::fs::read(config)?)?;
             if account.id.is_empty()
                 || account.imap_host.is_empty()
@@ -64,20 +78,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
             db.upsert_account(&account)?;
             println!("Account configuration saved. No credentials stored.");
         }
-        Command::Accounts => println!("{}", serde_json::to_string_pretty(&db.list_accounts()?)?),
-        Command::Mailboxes { account } => println!(
-            "{}",
-            serde_json::to_string_pretty(&db.list_mailboxes(&account)?)?
-        ),
+        Command::DiscoverAccount {
+            email,
+            imap_host,
+            imap_port,
+            username,
+        } => {
+            let discovery = mail_core::discover_account(
+                email,
+                DiscoveryOverrides {
+                    host: imap_host,
+                    port: imap_port,
+                    username,
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&discovery)?);
+        }
+        Command::Accounts => {
+            let db = Database::open(database_path)?;
+            println!("{}", serde_json::to_string_pretty(&db.list_accounts()?)?);
+        }
+        Command::Mailboxes { account } => {
+            let db = Database::open(database_path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&db.list_mailboxes(&account)?)?
+            );
+        }
         Command::Messages {
             mailbox,
             offset,
             limit,
-        } => println!(
-            "{}",
-            serde_json::to_string_pretty(&db.list_messages(&mailbox, offset, limit)?)?
-        ),
+        } => {
+            let db = Database::open(database_path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&db.list_messages(&mailbox, offset, limit)?)?
+            );
+        }
         Command::Sync { account } => {
+            let db = Database::open(database_path)?;
             let account = db
                 .list_accounts()?
                 .into_iter()

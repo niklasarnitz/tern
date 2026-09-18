@@ -31,6 +31,7 @@ let package = Package(
             exclude: [
                 "AGENTS.md",
                 "README.md",
+                "Resources",
                 "Tests",
                 "Generated/mail_coreFFI.h",
                 "Generated/mail_coreFFI.modulemap",

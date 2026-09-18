@@ -8,6 +8,7 @@ mail-model.workspace = true
 mail-db.workspace = true
 mail-imap.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true

@@ -11,6 +11,64 @@ pub struct Account {
     pub username: String,
     pub credential_ref: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum DiscoverySource {
+    Manual,
+    ProviderPreset,
+    DomainAutoconfig,
+    DnsSrv,
+    HostGuess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum AuthenticationKind {
+    Password,
+    OAuth2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct MailServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub source: DiscoverySource,
+    pub authentication: AuthenticationKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DiscoveryOverrides {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum DiagnosticStatus {
+    Available,
+    Unreachable,
+    TlsFailed,
+    InvalidResponse,
+    NotFound,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ConnectionDiagnostic {
+    pub source: DiscoverySource,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub status: DiagnosticStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AccountDiscovery {
+    pub email: String,
+    pub recommended: Option<MailServerConfig>,
+    pub candidates: Vec<MailServerConfig>,
+    pub diagnostics: Vec<ConnectionDiagnostic>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
 pub struct Mailbox {
     pub id: String,
@@ -34,6 +92,20 @@ pub struct MessageSummary {
     pub has_attachments: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct WidgetMailboxSummary {
+    pub id: String,
+    pub display_name: String,
+    pub unread_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
+pub struct WidgetSnapshot {
+    pub unread_count: u32,
+    pub mailboxes: Vec<WidgetMailboxSummary>,
+    pub important_messages: Vec<MessageSummary>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct Attachment {
     pub id: String,
@@ -48,6 +120,22 @@ pub struct MessageContent {
     pub plain_text: String,
     pub html: String,
     pub attachments: Vec<Attachment>,
+    pub delivery_report: Option<DeliveryReport>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DeliveryReport {
+    pub reporting_mta: String,
+    pub recipients: Vec<DeliveryRecipient>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct DeliveryRecipient {
+    pub recipient: String,
+    pub action: String,
+    pub status_code: String,
+    pub status_description: String,
+    pub diagnostic: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]

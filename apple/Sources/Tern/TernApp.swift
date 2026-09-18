@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct TernApp: App {
     @StateObject private var store = MailStore()
+    @State private var composeDraft: ComposeDraft?
 
     var body: some Scene {
         WindowGroup {
@@ -11,8 +12,29 @@ struct TernApp: App {
                 .task {
                     await store.start()
                 }
+                .onOpenURL { url in
+                    if let draft = MailtoURLParser.parse(url) {
+                        composeDraft = draft
+                    }
+                }
+                .sheet(item: $composeDraft) { draft in
+                    ComposeView(draft: draft)
+                }
         }
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button(store.pendingUndo.map { "Undo \($0.actionLabel)" } ?? "Undo") {
+                    Task { await store.undoLastAction() }
+                }
+                .keyboardShortcut("z", modifiers: [.command])
+                .disabled(store.pendingUndo == nil)
+            }
+            CommandGroup(replacing: .newItem) {
+                Button("New Message") {
+                    composeDraft = .empty
+                }
+                .keyboardShortcut("n", modifiers: [.command])
+            }
             CommandGroup(after: .sidebar) {
                 Button("Reload Cache") {
                     Task { await store.refresh() }
@@ -21,10 +43,79 @@ struct TernApp: App {
                 .disabled(!store.canRefresh)
             }
         }
+        Settings {
+            WidgetSettingsView(store: store)
+        }
     }
 }
 
-private struct MailRootView: View {
+struct WidgetSettingsView: View {
+    @ObservedObject var store: MailStore
+
+    var body: some View {
+        Form {
+            Section("Privacy") {
+                Picker("Show on widgets", selection: privacyBinding) {
+                    ForEach(WidgetPrivacy.allCases) { privacy in
+                        Text(privacy.title).tag(privacy)
+                    }
+                }
+                Text(
+                    "Counts only is the default. More private mail content is copied to the widget cache " +
+                        "only when you allow it."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Selected Mailboxes") {
+                if store.mailboxes.isEmpty {
+                    Text("Open an account to choose mailboxes.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.mailboxes, id: \.id) { mailbox in
+                        Toggle(
+                            mailbox.displayName.isEmpty ? mailbox.remoteName : mailbox.displayName,
+                            isOn: mailboxBinding(mailbox.id)
+                        )
+                    }
+                }
+                Text("Widgets read only the mailboxes selected here. No mailbox is shared by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let error = store.widgetErrorMessage {
+                Section {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480, height: 420)
+    }
+
+    private var privacyBinding: Binding<WidgetPrivacy> {
+        Binding(
+            get: { store.widgetPrivacy },
+            set: { privacy in
+                Task { await store.setWidgetPrivacy(privacy) }
+            }
+        )
+    }
+
+    private func mailboxBinding(_ mailboxID: String) -> Binding<Bool> {
+        Binding(
+            get: { store.isMailboxIncludedInWidgets(mailboxID) },
+            set: { included in
+                Task { await store.setMailbox(mailboxID, includedInWidgets: included) }
+            }
+        )
+    }
+}
+
+struct MailRootView: View {
     @ObservedObject var store: MailStore
 
     var body: some View {
@@ -44,10 +135,20 @@ private struct MailRootView: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) {
+            if let notice = store.pendingUndo {
+                UndoBanner(actionLabel: notice.actionLabel) {
+                    Task { await store.undoLastAction() }
+                }
+                .padding(.bottom, 16)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: store.pendingUndo)
     }
 }
 
-private struct MailSidebar: View {
+struct MailSidebar: View {
     @ObservedObject var store: MailStore
 
     var body: some View {
@@ -115,27 +216,54 @@ private struct MailSidebar: View {
     }
 }
 
-private struct MessageListView: View {
+struct MessageListView: View {
     @ObservedObject var store: MailStore
 
     var body: some View {
         Group {
             if store.isLoadingMessages, store.messages.isEmpty {
                 ProgressView("Loading messages…")
-            } else if store.mailboxes.isEmpty {
+            } else if store.mailboxes.isEmpty, !store.isSearching {
                 ContentUnavailableView("Select an Account", systemImage: "sidebar.left")
             } else if store.messages.isEmpty, !store.isLoadingMessages {
-                ContentUnavailableView("No Messages", systemImage: "tray")
+                if store.isSearching {
+                    ContentUnavailableView.search(text: store.activeSearchQuery ?? "")
+                } else {
+                    ContentUnavailableView("No Messages", systemImage: "tray")
+                }
             } else {
                 List(store.messages, id: \.id, selection: $store.selectedMessageID) { message in
                     MessageRow(message: message)
                         .tag(message.id as String?)
+                        .contextMenu {
+                            MessageActionButtons(store: store, message: message)
+                        }
                 }
                 .listStyle(.inset)
             }
         }
-        .navigationTitle(store.selectedMailbox?.displayName ?? "Mail")
+        .navigationTitle(
+            store.isSearching ? "Search Results" : store.selectedMailbox?.displayName ?? "Mail"
+        )
+        .searchable(
+            text: $store.searchText,
+            placement: .toolbar,
+            prompt: "Search or use from:, before:, is:unread…"
+        )
+        .onSubmit(of: .search) {
+            Task { await store.submitSearch() }
+        }
+        .onChange(of: store.searchText) { _, query in
+            if query.isEmpty, store.isSearching {
+                Task { await store.clearSearch() }
+            }
+        }
         .toolbar {
+            ToolbarItemGroup {
+                if let message = store.selectedMessage {
+                    MessageActionButtons(store: store, message: message)
+                }
+            }
             ToolbarItem {
                 Button {
                     Task { await store.refresh() }
@@ -177,111 +305,59 @@ private struct MessageListView: View {
     private var pageLabel: String {
         let first = store.messageOffset + 1
         let last = store.messageOffset + UInt32(store.messages.count)
-        return "Messages \(first)–\(last)"
+        let noun = store.isSearching ? "Results" : "Messages"
+        return "\(noun) \(first)–\(last)"
     }
 }
 
-private struct MessageRow: View {
+struct MessageActionButtons: View {
+    @ObservedObject var store: MailStore
     let message: MessageSummary
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(message.isRead ? .clear : Color.accentColor)
-                .frame(width: 8, height: 8)
-                .padding(.top, 6)
-
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(message.sender.isEmpty ? "Unknown sender" : message.sender)
-                        .fontWeight(message.isRead ? .regular : .semibold)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Text(message.date)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                HStack(spacing: 6) {
-                    Text(message.subject.isEmpty ? "(No subject)" : message.subject)
-                        .fontWeight(message.isRead ? .regular : .semibold)
-                        .lineLimit(1)
-                    if message.isStarred {
-                        Image(systemName: "star.fill")
-                            .foregroundStyle(.yellow)
-                            .font(.caption)
-                    }
-                    if message.hasAttachments {
-                        Image(systemName: "paperclip")
-                            .foregroundStyle(.secondary)
-                            .font(.caption)
-                    }
-                }
-                if !message.snippet.isEmpty {
-                    Text(message.snippet)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
+        if let archive = store.archiveMailbox {
+            actionButton("Archive", systemImage: "archivebox", destination: archive, result: "Archived")
         }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct MessageDetailView: View {
-    let message: MessageSummary?
-
-    var body: some View {
-        if let message {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(message.subject.isEmpty ? "(No subject)" : message.subject)
-                        .font(.title2.weight(.semibold))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(message.sender.isEmpty ? "Unknown sender" : message.sender)
-                            .font(.headline)
-                        Text(message.date)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    Divider()
-                    if message.snippet.isEmpty {
-                        Text("This message has no locally stored preview.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(message.snippet)
-                            .textSelection(.enabled)
+        if let trash = store.trashMailbox {
+            actionButton("Delete", systemImage: "trash", destination: trash, result: "Deleted")
+        }
+        if let spam = store.spamMailbox {
+            actionButton(
+                "Mark as Spam",
+                systemImage: "exclamationmark.octagon",
+                destination: spam,
+                result: "Marked as Spam"
+            )
+        }
+        if !store.moveDestinations.isEmpty {
+            Menu {
+                ForEach(store.moveDestinations, id: \.id) { mailbox in
+                    Button(mailbox.displayName.isEmpty ? mailbox.remoteName : mailbox.displayName) {
+                        move(to: mailbox, result: "Moved")
                     }
                 }
-                .frame(maxWidth: 760, alignment: .leading)
-                .padding(32)
+            } label: {
+                Label("Move to", systemImage: "folder")
             }
-            .navigationTitle(message.subject.isEmpty ? "Message" : message.subject)
-        } else {
-            ContentUnavailableView("No Message Selected", systemImage: "envelope")
+            .disabled(store.isPerformingAction)
         }
     }
-}
 
-private struct ErrorOverlay: View {
-    let message: String
-    let retry: () -> Void
-
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.title2)
-            Text(message)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-            Button("Retry", action: retry)
-                .keyboardShortcut(.defaultAction)
+    private func actionButton(
+        _ title: String,
+        systemImage: String,
+        destination: Mailbox,
+        result: String
+    ) -> some View {
+        Button {
+            move(to: destination, result: result)
+        } label: {
+            Label(title, systemImage: systemImage)
         }
-        .padding(24)
-        .frame(maxWidth: 360)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .shadow(radius: 12)
+        .disabled(store.isPerformingAction)
+    }
+
+    private func move(to mailbox: Mailbox, result: String) {
+        Task { await store.moveMessage(message, to: mailbox, actionLabel: result) }
     }
 }

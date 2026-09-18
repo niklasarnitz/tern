@@ -13,6 +13,7 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
     let path = directory.path().join("mail.sqlite");
     let path = path.to_str().unwrap();
     let mailbox_id;
+    let archive_id;
     {
         let db = Database::open(path).unwrap();
         db.upsert_account(&Account {
@@ -48,18 +49,52 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
             )
             .unwrap();
         mailbox_id = mailbox.id;
+        archive_id = db
+            .apply_snapshot(
+                "test-account",
+                &MailboxSnapshot {
+                    remote_name: "Archive".into(),
+                    uid_validity: 3,
+                    uid_next: Some(1),
+                    headers: Vec::new(),
+                },
+            )
+            .unwrap()
+            .id;
     }
     let client = MailClient::new(path.into()).unwrap();
     assert_eq!(client.list_accounts().unwrap().len(), 1);
     assert_eq!(
         client.list_mailboxes("test-account".into()).unwrap().len(),
-        1
+        2
     );
     let page = client.list_messages(mailbox_id.clone(), 0, 30).unwrap();
     assert_eq!(page.len(), 30);
     assert_eq!(page[0].remote_uid, 100);
-    let final_page = client.list_messages(mailbox_id, 90, 30).unwrap();
+    let final_page = client.list_messages(mailbox_id.clone(), 90, 30).unwrap();
     assert_eq!(final_page.len(), 10);
+    let search_page = client
+        .search_messages(
+            "subject:\"Message 41\" from:Sender is:unread account:test-account".into(),
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(search_page.len(), 1);
+    assert_eq!(search_page[0].remote_uid, 41);
+
+    let operation_id = client
+        .queue_message_move(mailbox_id.clone(), page[0].id.clone(), archive_id, i64::MAX)
+        .unwrap();
+    assert_eq!(
+        client
+            .list_messages(mailbox_id.clone(), 0, 100)
+            .unwrap()
+            .len(),
+        99
+    );
+    assert!(client.undo_operation(operation_id).unwrap());
+    assert_eq!(client.list_messages(mailbox_id, 0, 100).unwrap().len(), 100);
     drop(client);
     std::fs::remove_file(path).unwrap();
 }

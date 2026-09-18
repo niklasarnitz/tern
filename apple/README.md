@@ -19,7 +19,25 @@ TERN_DATABASE=/absolute/path/to/mail.sqlite devbox run macos
 devbox run check-swift
 ```
 
+The run script builds and registers a development `Tern.app` bundle. Its URL
+type declaration lets macOS offer Tern as a handler for `mailto:` links. Opening
+one creates a compose draft with its recipients, Cc/Bcc, subject, body, and any
+local-file `attach` or `attachment` parameters. SMTP is not implemented yet, so
+the draft can be reviewed but not sent.
+
 Without `TERN_DATABASE`, the app uses
 `~/Library/Application Support/Tern/mail.sqlite`. The message list requests a
 maximum of 101 summaries (100 displayed plus one pagination probe), so opening the app never
 loads an entire mailbox into Swift memory.
+
+## Widget extension sources
+
+`Sources/TernWidgets/TernWidgets.swift` contains macOS/iOS WidgetKit configurations for unread mail,
+recent starred mail, and selected-mailbox counts. The app publishes a bounded, privacy-filtered
+snapshot into the `group.com.niklasarnitz.tern` app group; no extension opens SQLite or links the
+Rust core. Counts-only sharing is the default and no mailbox is selected by default.
+
+The current SwiftPM executable cannot package an `.appex`. When Tern gains its installable Xcode
+app targets, add `Sources/TernWidgets/TernWidgets.swift` and `Sources/Tern/WidgetShared.swift` to a Widget
+Extension target on iOS and macOS, and give both the app and extension the app-group entitlement.
+Quick compose is intentionally not advertised yet because Tern has no compose or SMTP operation.

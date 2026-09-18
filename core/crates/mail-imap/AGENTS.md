@@ -27,10 +27,12 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 ## Coordination
 
 Protocol or snapshot changes require coordination with `mail-mime`,
-`mail-model`, `mail-sync`, and `mail-db` identity rules. STARTTLS, OAuth,
-incremental sync, IDLE, and SMTP remain future work. Message bodies and
-attachments flow through the bounded MIME normalization path; mutations remain
-owned by store/sync orchestration.
+`mail-model`, `mail-sync`, and `mail-db` identity rules. IDLE is limited to a
+bounded change notification with polling fallback; reconnect policy belongs to
+`mail-sync`. STARTTLS, OAuth, incremental reconciliation, and SMTP remain future
+slices. Message bodies and attachments flow through the bounded MIME
+normalization path; mutations remain owned by store/sync orchestration. Do not
+introduce placeholder implementations here.
 
 ## Validation
 
