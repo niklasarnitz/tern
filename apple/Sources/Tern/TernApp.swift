@@ -4,12 +4,21 @@ import SwiftUI
 @main
 struct TernApp: App {
     @StateObject private var store = MailStore()
+    @State private var composeDraft: ComposeDraft?
 
     var body: some Scene {
         WindowGroup {
             MailRootView(store: store)
                 .task {
                     await store.start()
+                }
+                .onOpenURL { url in
+                    if let draft = MailtoURLParser.parse(url) {
+                        composeDraft = draft
+                    }
+                }
+                .sheet(item: $composeDraft) { draft in
+                    ComposeView(draft: draft)
                 }
         }
         .commands {
@@ -19,6 +28,12 @@ struct TernApp: App {
                 }
                 .keyboardShortcut("z", modifiers: [.command])
                 .disabled(store.pendingUndo == nil)
+            }
+            CommandGroup(replacing: .newItem) {
+                Button("New Message") {
+                    composeDraft = .empty
+                }
+                .keyboardShortcut("n", modifiers: [.command])
             }
             CommandGroup(after: .sidebar) {
                 Button("Reload Cache") {

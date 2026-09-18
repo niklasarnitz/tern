@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 source scripts/apple-toolchain.sh
 swiftlint lint --strict --config .swiftlint.yml
 swiftformat --lint apple/Sources apple/Tests apple/Package.swift --config .swiftformat
+plutil -lint apple/Resources/Info.plist
 bash scripts/generate-bindings.sh
 mkdir -p .devbox/checks
 fixture_directory=$(mktemp -d "${TMPDIR:-/tmp}/tern-bridge.XXXXXX")

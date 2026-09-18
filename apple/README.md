@@ -19,6 +19,12 @@ TERN_DATABASE=/absolute/path/to/mail.sqlite devbox run macos
 devbox run check-swift
 ```
 
+The run script builds and registers a development `Tern.app` bundle. Its URL
+type declaration lets macOS offer Tern as a handler for `mailto:` links. Opening
+one creates a compose draft with its recipients, Cc/Bcc, subject, body, and any
+local-file `attach` or `attachment` parameters. SMTP is not implemented yet, so
+the draft can be reviewed but not sent.
+
 Without `TERN_DATABASE`, the app uses
 `~/Library/Application Support/Tern/mail.sqlite`. The message list requests a
 maximum of 101 summaries (100 displayed plus one pagination probe), so opening the app never
