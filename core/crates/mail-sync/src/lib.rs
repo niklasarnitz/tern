@@ -2,9 +2,13 @@
 use mail_db::Database;
 use mail_model::{Account, Mailbox};
 
-/// Implemented by platform credential stores. SQLite holds only the reference.
+/// Implemented by platform credential stores. `SQLite` holds only the reference.
 /// Credentials must never be included in errors or tracing fields.
 pub trait CredentialProvider {
+    /// Resolve the referenced credential without persisting its value.
+    ///
+    /// # Errors
+    /// Returns `CredentialUnavailable` if the platform cannot provide it.
     fn password(&self, credential_ref: &str) -> Result<String, SyncError>;
 }
 
@@ -16,8 +20,11 @@ pub enum SyncError {
     Sync(String),
 }
 
-/// Fetch fully before opening a SQLite transaction. A network failure leaves the
+/// Fetch fully before opening a `SQLite` transaction. A network failure leaves the
 /// previous offline snapshot readable. This first slice syncs Inbox headers only.
+///
+/// # Errors
+/// Returns an error if credentials, the server, TLS or local persistence fail.
 pub async fn sync_inbox(
     db: &Database,
     account: &Account,

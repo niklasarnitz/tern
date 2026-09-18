@@ -8,11 +8,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-mail-model = { path = "crates/mail-model" }
-mail-db = { path = "crates/mail-db" }
-mail-imap = { path = "crates/mail-imap" }
-mail-mime = { path = "crates/mail-mime" }
-mail-sync = { path = "crates/mail-sync" }
+mail-model = { path = "crates/mail-model", version = "0.1.0" }
+mail-db = { path = "crates/mail-db", version = "0.1.0" }
+mail-imap = { path = "crates/mail-imap", version = "0.1.0" }
+mail-mime = { path = "crates/mail-mime", version = "0.1.0" }
+mail-sync = { path = "crates/mail-sync", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 uniffi = "0.32"
