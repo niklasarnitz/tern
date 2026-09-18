@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     date: "2026-09-18T09:30:00+00:00".into(),
                     is_read: uid % 2 == 0,
                     is_starred: uid % 5 == 0,
+                    ..RemoteHeader::default()
                 })
                 .collect(),
         },

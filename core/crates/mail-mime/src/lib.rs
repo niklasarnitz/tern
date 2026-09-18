@@ -43,6 +43,7 @@ pub fn parse_header(uid: u32, bytes: &[u8], is_read: bool, is_starred: bool) -> 
         date,
         is_read,
         is_starred,
+        ..RemoteHeader::default()
     }
 }
 

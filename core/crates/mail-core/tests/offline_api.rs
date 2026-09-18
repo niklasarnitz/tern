@@ -41,6 +41,7 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
                             date: "2026-09-18".into(),
                             is_read: uid % 2 == 0,
                             is_starred: false,
+                            ..RemoteHeader::default()
                         })
                         .collect(),
                 },
