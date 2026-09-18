@@ -5,6 +5,8 @@
 `mail-imap` owns the first slice's read-only IMAP boundary: verified implicit
 TLS, authenticated Inbox header snapshots, and selectable remote mailbox names.
 It converts protocol data into `mail-model` snapshots through `mail-mime`.
+Inherit shared repository guidance from [`../../../AGENTS.md`](../../../AGENTS.md);
+dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependencies.md).
 
 ## Invariants
 
@@ -14,10 +16,9 @@ It converts protocol data into `mail-model` snapshots through `mail-mime`.
 - `EXAMINE` and `BODY.PEEK` keep header sync read-only. Keep the bounded recent
   fetch, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and timeout
   behavior intact.
-- Streaming loops may ignore unrelated typed responses, but must drain until
-  the matching request tag and inspect its typed status. A matching tagged
-  `NO`/non-OK is a protocol error; never discard completion status or accept a
-  partial snapshot.
+- `async-imap` convenience streaming helpers can discard tagged failure status.
+  Retain the `run_command`/`read_response` typed adapter: drain until the
+  matching request tag, inspect its status, and reject tagged `NO`/non-OK.
 - Preserve sanitized `ImapError` values. Credentials, server response text,
   and account-sensitive diagnostics must not appear in errors or tracing.
 
@@ -35,6 +36,5 @@ From the repository root, run:
 ```sh
 devbox run -- cargo test --manifest-path core/Cargo.toml -p mail-imap --locked
 ```
-
 For model/API or bridge-visible changes, also run the affected downstream tests
 and the broader Rust/Swift checks required by the root guidance.

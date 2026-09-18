@@ -5,7 +5,8 @@
 `mail-core` is the stable application facade exposed to Apple through UniFFI.
 The current `MailClient` opens the canonical local store and offers read-only
 account, mailbox, and bounded message-list queries. The CLI is the development
-owner of account configuration and sync.
+owner of account configuration and sync. Inherit shared guidance from
+[`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
 
@@ -35,5 +36,5 @@ From the repository root, run:
 devbox run -- cargo test --manifest-path core/Cargo.toml -p mail-core --locked
 ```
 
-For UniFFI or Apple-facing changes, also run binding generation, `devbox run
-check-swift`, and the broader validation required by the root guidance.
+For UniFFI or Apple-facing changes, also run binding generation, `devbox run check-swift`,
+and the broader validation required by the root guidance.

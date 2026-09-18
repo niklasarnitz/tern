@@ -4,7 +4,7 @@
 
 `mail-mime` normalizes fetched RFC 5322 headers into `mail-model::RemoteHeader`.
 The current boundary is header metadata only; database and UI layers should not
-depend on `mail-parser` types.
+depend on `mail-parser` types. Inherit shared guidance from [`../../../AGENTS.md`](../../../AGENTS.md).
 
 ## Invariants
 
