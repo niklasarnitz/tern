@@ -29,6 +29,7 @@ let package = Package(
             name: "Tern",
             path: ".",
             exclude: [
+                "AGENTS.md",
                 "README.md",
                 "Tests",
                 "Generated/mail_coreFFI.h",

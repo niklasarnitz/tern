@@ -57,3 +57,7 @@ The first macOS build needs network access to download build dependencies; once 
 See [architecture and milestones](docs/architecture.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
 
 Still ahead: all-folder sync, incremental updates and events, message bodies/HTML, offline mutations, SMTP/compose, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.
+
+## Agent guidance
+
+Start with [AGENTS.md](AGENTS.md) for architecture boundaries, subagent worktrees, review/merge policy and required checks. Each Rust crate, the Apple app and build scripts have scoped `AGENTS.md` instructions.
