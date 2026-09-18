@@ -6,7 +6,7 @@ use mail_model::{Attachment, MessageContent, RemoteHeader};
 use mail_parser::{
     Addr, HeaderForm, HeaderName, HeaderValue, MessageParser, MimeHeaders, PartType,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
@@ -206,7 +206,7 @@ fn sanitize_filename(value: &str) -> String {
         .to_owned()
 }
 fn sanitize_html(html: &str) -> String {
-    Builder::default()
+    Builder::empty()
         .tags(HashSet::from([
             "a",
             "b",
@@ -237,17 +237,32 @@ fn sanitize_html(html: &str) -> String {
             "tr",
             "ul",
         ]))
+        .clean_content_tags(HashSet::from([
+            "applet", "audio", "canvas", "embed", "iframe", "math", "noembed", "noscript",
+            "object", "script", "style", "svg", "template", "video",
+        ]))
+        .tag_attributes(HashMap::from([
+            ("a", HashSet::from(["href"])),
+            ("img", HashSet::from(["alt", "src"])),
+        ]))
+        .generic_attributes(HashSet::new())
         .url_schemes(HashSet::from(["http", "https", "mailto", "cid"]))
         .url_relative(UrlRelative::Deny)
-        .attribute_filter(|element, attribute, value| {
-            if element == "img" && attribute == "src" && !value.starts_with("cid:") {
-                None
-            } else {
-                Some(value.into())
-            }
+        .attribute_filter(|element, attribute, value| match (element, attribute) {
+            ("img", "src") if !has_cid_scheme(value) => None,
+            ("a", "href") if has_cid_scheme(value) => None,
+            _ => Some(value.into()),
         })
+        .link_rel(Some("noopener noreferrer"))
+        .strip_comments(true)
         .clean(html)
         .to_string()
+}
+
+fn has_cid_scheme(value: &str) -> bool {
+    value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cid:"))
 }
 
 #[must_use]
@@ -438,11 +453,82 @@ mod tests {
         );
     }
     #[test]
-    fn sanitizes_active_and_remote_html() {
-        let clean = sanitize_html(
-            "<script>alert(1)</script><img src=\"https://x.test/a\"><img src=\"cid:abc\">",
+    fn sanitizes_active_embedded_and_form_html() {
+        let clean = sanitize_html(concat!(
+            "<script>alert(1)</script><style>body{display:none}</style>",
+            "<form action=\"https://evil.test\"><p>visible</p>",
+            "<input name=secret><button formaction=\"https://evil.test\">Send</button></form>",
+            "<iframe srcdoc=\"<script>alert(2)</script>\">frame</iframe>",
+            "<object data=\"https://evil.test\">object</object>",
+            "<embed src=\"https://evil.test\"><svg onload=\"alert(3)\"><circle/></svg>",
+            "<p onclick=\"alert(4)\">safe</p>",
+        ));
+        assert!(
+            clean.contains("<p>visible</p>") && clean.contains("Send") && clean.contains("safe")
         );
-        assert!(!clean.contains("script") && !clean.contains("https://"));
-        assert!(clean.contains("cid:abc"));
+        for forbidden in [
+            "script",
+            "style",
+            "form",
+            "input",
+            "button",
+            "iframe",
+            "object",
+            "embed",
+            "svg",
+            "onclick",
+            "formaction",
+            "https://evil.test",
+            "alert(",
+        ] {
+            assert!(!clean.contains(forbidden), "retained {forbidden}: {clean}");
+        }
+    }
+
+    #[test]
+    fn blocks_tracking_and_local_resource_urls() {
+        let clean = sanitize_html(concat!(
+            "<img src=\"https://tracker.test/pixel\" alt=remote>",
+            "<img src=\"//tracker.test/pixel\" alt=relative>",
+            "<img src=\"file:///etc/passwd\" alt=file>",
+            "<img src=\"cid:part-1\" alt=inline width=1 height=1>",
+            "<a href=\"file:///etc/passwd\">file link</a>",
+            "<a href=\"cid:part-1\">cid link</a>",
+            "<a href=\"https://example.test/path\">web link</a>",
+        ));
+        assert!(!clean.contains("tracker.test") && !clean.contains("file:///"));
+        assert!(clean.contains("<img src=\"cid:part-1\" alt=\"inline\">"));
+        assert!(
+            !clean.contains("width=")
+                && !clean.contains("height=")
+                && !clean.contains("href=\"cid:")
+        );
+        assert!(clean.contains("href=\"https://example.test/path\" rel=\"noopener noreferrer\""));
+    }
+
+    #[test]
+    fn blocks_dangerous_urls_and_css_abuse() {
+        let clean = sanitize_html(concat!(
+            "<style>@import url(https://tracker.test);</style>",
+            "<div id=overlay class=cover style=\"position:fixed;background:url(https://tracker.test)\">",
+            "<a href=\"java&#x73;cript:alert(1)\">script</a>",
+            "<a href=\"data:text/html,evil\">data</a>",
+            "<a href=\"mailto:user@example.test\">mail</a></div>",
+        ));
+        for forbidden in [
+            "style=",
+            "<style",
+            "@import",
+            "class=",
+            "id=",
+            "position",
+            "tracker.test",
+            "javascript:",
+            "data:text/html",
+            "alert(",
+        ] {
+            assert!(!clean.contains(forbidden), "retained {forbidden}: {clean}");
+        }
+        assert!(clean.contains("href=\"mailto:user@example.test\""));
     }
 }
