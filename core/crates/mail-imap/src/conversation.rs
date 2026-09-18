@@ -1,7 +1,7 @@
 //! Conversation downloads and replay of durable, UID-scoped local actions.
 use super::{
-    connect_and_login, fetch_headers_session, validate_account, ImapError, Result,
-    OPERATION_TIMEOUT,
+    classify_imap_error, classify_io_error, connect_and_login, fetch_headers_session,
+    validate_account, ImapError, Result, OPERATION_TIMEOUT,
 };
 use async_imap::{
     imap_proto::{types::AttributeValue, Response, Status},
@@ -33,7 +33,7 @@ pub async fn fetch_mailbox(
     let capabilities = timeout(OPERATION_TIMEOUT, session.capabilities())
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
     let mut snapshot = timeout(
         OPERATION_TIMEOUT,
         fetch_headers_session(
@@ -86,14 +86,14 @@ where
             "UID FETCH {uid} (UID RFC822.SIZE BODY.PEEK[]<0.{maximum}>)"
         ))
         .await
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
     let mut parsed = None;
     let mut problem = None;
     loop {
         let response = session
             .read_response()
             .await
-            .map_err(|_| ImapError::Protocol)?
+            .map_err(|error| classify_io_error(&error))?
             .ok_or(ImapError::Connection)?;
         match response.parsed() {
             Response::Fetch(_, attributes) => {
@@ -195,7 +195,7 @@ where
     let mailbox = session
         .select(&operation.remote_name)
         .await
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
     if mailbox.uid_validity != Some(operation.uid_validity) {
         return Err(ImapError::StaleMailbox);
     }
@@ -209,7 +209,7 @@ where
             let capabilities = session
                 .capabilities()
                 .await
-                .map_err(|_| ImapError::Protocol)?;
+                .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
             if !capabilities.has_str("MOVE") {
                 return Err(ImapError::MoveUnsupported);
             }
@@ -240,12 +240,12 @@ where
     let tag = session
         .run_command(command)
         .await
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
     loop {
         let response = session
             .read_response()
             .await
-            .map_err(|_| ImapError::Protocol)?
+            .map_err(|error| classify_io_error(&error))?
             .ok_or(ImapError::Connection)?;
         if let Response::Done {
             tag: received,

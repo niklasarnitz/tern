@@ -22,7 +22,7 @@ Credentials are requested through a Rust `CredentialProvider`. The prototype CLI
 
 ## Following slices
 
-1. Incremental sync: UID high-water marks, changed flags, deletion reconciliation, reconnect/backoff, capability negotiation and IDLE. CONDSTORE/QRESYNC/MOVE/UIDPLUS/SPECIAL-USE have conventional-IMAP fallbacks. UIDNEXT is not a message count. Empty UID ranges must not fetch older messages accidentally.
+1. Incremental sync: UID high-water marks, changed flags and deletion reconciliation. The network boundary already reconnects transient failures with bounded backoff, uses bounded IDLE with a polling fallback, and opens a fresh DNS/socket/TLS path on every attempt. CONDSTORE/QRESYNC/MOVE/UIDPLUS/SPECIAL-USE have conventional-IMAP fallbacks. UIDNEXT is not a message count. Empty UID ranges must not fetch older messages accidentally.
 2. Message bodies: lazy fetch, MIME normalization, plain text and sanitized HTML in WKWebView. Block remote resources by default; restrict navigation, scripts, and local-file access. Inline content and attachment storage need explicit ownership and cleanup.
 3. Offline actions: mutate local membership and enqueue an operation atomically; reconcile retries after reconnect. Operations retain UIDVALIDITY and account scope. Define conflicts and idempotency before enabling moves/deletes.
 4. SMTP and [sender identities](identities.md): local drafts/outbox, multiple From addresses, Reply-To, per-identity signatures, automatic reply identity selection, MIME construction, TLS, reply/reply-all/forward, attachments, and provider-specific Sent handling. Ambiguous delivery cannot be blindly retried.

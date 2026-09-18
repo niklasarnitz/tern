@@ -14,6 +14,13 @@ Validated against upstream documentation and the repository build. `core/Cargo.l
 | Push HTTP service | Axum | Small typed wake-relay surface with explicit body limits; independently deployed and not linked into the client. |
 | Apple push transport | Hyper, rustls and ring | Token-authenticated APNs HTTP/2 with the same current TLS stack as IMAP and no OpenSSL runtime dependency. Notifications contain only an opaque subscription ID. |
 
+Network operations have bounded connect and command timeouts. Socket, DNS and
+IDLE disconnects retry on a fresh connection with capped exponential backoff
+and deterministic jitter; this also re-resolves addresses after Wi-Fi/cellular
+or IPv4/IPv6 changes. Certificate, authentication and protocol failures fail
+fast. IDLE is renewed within 25 minutes and falls back to periodic polling when
+the server does not advertise the capability.
+
 References:
 
 - [async-imap](https://docs.rs/async-imap/latest/async_imap/)

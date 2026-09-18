@@ -22,6 +22,10 @@ seam; it owns IMAP and SQLite sequencing. Inherit shared guidance from
   durable retry state, and let UIDVALIDITY changes mark stale operations rather
   than silently applying them to a new remote identity. Keep transaction ordering
   explicit: finish network work before opening the store write transaction.
+- Transient connection failures and dropped IDLE sessions retry asynchronously
+  with bounded backoff. Permanent configuration, TLS, authentication and
+  protocol failures fail fast. Keep future reconciliation changes explicit
+  about their transaction and conflict semantics.
 
 ## Coordination
 
@@ -38,7 +42,3 @@ devbox run -- cargo test --manifest-path core/Cargo.toml -p mail-sync --locked
 
 For contract or bridge-visible changes, run affected downstream tests and the
 broader Rust/Swift checks required by the root guidance.
-
-The current crate has no unit tests beyond compile/doc-test coverage; behavior
-changes require affected producer/consumer or integration tests; zero tests are
-not proof.

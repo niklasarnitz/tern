@@ -1281,6 +1281,7 @@ dependencies = [
  "mail-imap",
  "mail-model",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
