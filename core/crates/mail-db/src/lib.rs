@@ -9,7 +9,10 @@ use std::{ops::Deref, path::Path};
 use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 2;
+mod conversations;
+mod mutations;
+
+const SCHEMA_VERSION: i64 = 3;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -24,6 +27,22 @@ pub enum DatabaseError {
     RemoteIdentityChange { account_id: String },
     #[error("snapshot contains {actual} headers; maximum is {max}")]
     SnapshotTooLarge { actual: usize, max: usize },
+    #[error("message {message_id} is not in mailbox {mailbox_id}")]
+    MessageNotInMailbox {
+        message_id: String,
+        mailbox_id: String,
+    },
+    #[error("thread {thread_id} has no messages in mailbox {mailbox_id}")]
+    ThreadNotInMailbox {
+        thread_id: String,
+        mailbox_id: String,
+    },
+    #[error("move requires an existing destination mailbox")]
+    InvalidMoveDestination,
+    #[error("pending operation {0} does not exist")]
+    PendingOperationNotFound(String),
+    #[error("mail data could not be serialized: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -292,8 +311,10 @@ impl Database {
     }
 }
 
+// Schema text stays together so each migration transaction is reviewable.
+#[allow(clippy::too_many_lines)]
 fn migrate(connection: &Connection) -> Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(DatabaseError::UnsupportedSchemaVersion(version));
     }
@@ -326,7 +347,16 @@ fn migrate(connection: &Connection) -> Result<()> {
                  sender TEXT NOT NULL,
                  date TEXT NOT NULL,
                  snippet TEXT NOT NULL DEFAULT '',
-                 has_attachments INTEGER NOT NULL DEFAULT 0
+                 has_attachments INTEGER NOT NULL DEFAULT 0,
+                 thread_id TEXT,
+                 canonical_message_id TEXT,
+                 recipients_json TEXT NOT NULL DEFAULT '[]',
+                 cc_json TEXT NOT NULL DEFAULT '[]',
+                 sent_at INTEGER,
+                 provider_message_id TEXT,
+                 provider_thread_id TEXT,
+                 content_json TEXT,
+                 header_fingerprint TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE mailbox_messages (
                  mailbox_id TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
@@ -335,22 +365,123 @@ fn migrate(connection: &Connection) -> Result<()> {
                  remote_uid INTEGER NOT NULL,
                  is_read INTEGER NOT NULL DEFAULT 0,
                  is_starred INTEGER NOT NULL DEFAULT 0,
+                 local_only INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY(mailbox_id, uid_validity, remote_uid)
+             );
+             CREATE TABLE threads (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE thread_keys (
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 key TEXT NOT NULL,
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 PRIMARY KEY(account_id, key)
+             );
+             CREATE TABLE pending_operations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 mailbox_id TEXT NOT NULL,
+                 remote_name TEXT NOT NULL,
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 uid_validity INTEGER NOT NULL,
+                 remote_uid INTEGER NOT NULL,
+                 action TEXT NOT NULL,
+                 destination_mailbox_id TEXT,
+                 destination_remote_name TEXT,
+                 state TEXT NOT NULL DEFAULT 'pending',
+                 retry_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT
              );
              CREATE INDEX mailbox_messages_page_idx
                  ON mailbox_messages(mailbox_id, uid_validity, remote_uid DESC);
              CREATE INDEX messages_account_idx ON messages(account_id);
              CREATE INDEX mailbox_messages_message_id_idx ON mailbox_messages(message_id);
-             PRAGMA user_version = 2;
+             CREATE INDEX messages_thread_idx ON messages(thread_id, sent_at, date, id);
+             CREATE INDEX messages_provider_idx ON messages(account_id, provider_message_id);
+             CREATE INDEX pending_operations_account_idx
+                 ON pending_operations(account_id, state, id);
+             PRAGMA user_version = 3;
              COMMIT;",
         )?;
-    } else if version == 1 {
+    }
+    if version == 1 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
                  ON mailbox_messages(message_id);
              PRAGMA user_version = 2;
              COMMIT;",
+        )?;
+        version = 2;
+    }
+    if version == 2 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE messages ADD COLUMN thread_id TEXT;
+             ALTER TABLE messages ADD COLUMN canonical_message_id TEXT;
+             ALTER TABLE messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '[]';
+             ALTER TABLE messages ADD COLUMN cc_json TEXT NOT NULL DEFAULT '[]';
+             ALTER TABLE messages ADD COLUMN sent_at INTEGER;
+             ALTER TABLE messages ADD COLUMN provider_message_id TEXT;
+             ALTER TABLE messages ADD COLUMN provider_thread_id TEXT;
+             ALTER TABLE messages ADD COLUMN content_json TEXT;
+             ALTER TABLE messages ADD COLUMN header_fingerprint TEXT NOT NULL DEFAULT '';
+             ALTER TABLE mailbox_messages ADD COLUMN local_only INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE threads (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE thread_keys (
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 key TEXT NOT NULL,
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 PRIMARY KEY(account_id, key)
+             );
+             CREATE TABLE pending_operations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 mailbox_id TEXT NOT NULL,
+                 remote_name TEXT NOT NULL,
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 uid_validity INTEGER NOT NULL,
+                 remote_uid INTEGER NOT NULL,
+                 action TEXT NOT NULL,
+                 destination_mailbox_id TEXT,
+                 destination_remote_name TEXT,
+                 state TEXT NOT NULL DEFAULT 'pending',
+                 retry_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT
+             );
+             CREATE INDEX messages_thread_idx ON messages(thread_id, sent_at, date, id);
+             CREATE INDEX messages_provider_idx ON messages(account_id, provider_message_id);
+             CREATE INDEX pending_operations_account_idx
+                 ON pending_operations(account_id, state, id);
+             ",
+        )?;
+        backfill_threads(connection)?;
+        connection.execute_batch("PRAGMA user_version = 3; COMMIT;")?;
+    }
+    Ok(())
+}
+
+fn backfill_threads(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("SELECT id, account_id FROM messages ORDER BY id")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (message_id, account_id) in rows {
+        let thread_id = format!("thr:{}:{}", account_id.len(), message_id);
+        connection.execute(
+            "INSERT INTO threads (id, account_id) VALUES (?1, ?2)",
+            params![thread_id, account_id],
+        )?;
+        connection.execute(
+            "UPDATE messages SET thread_id = ?2 WHERE id = ?1",
+            params![message_id, thread_id],
         )?;
     }
     Ok(())
@@ -389,28 +520,21 @@ fn invalidate_mailbox_memberships<T>(transaction: &T, mailbox_id: &str) -> Resul
 where
     T: Deref<Target = Connection>,
 {
-    let mut statement =
-        transaction.prepare("SELECT message_id FROM mailbox_messages WHERE mailbox_id = ?1")?;
-    let ids = statement
-        .query_map([mailbox_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-
+    transaction.execute(
+        "UPDATE pending_operations SET state = 'stale',
+             last_error = 'mailbox UIDVALIDITY changed before replay'
+         WHERE mailbox_id = ?1 AND state IN ('pending', 'failed')",
+        [mailbox_id],
+    )?;
     transaction.execute(
         "DELETE FROM mailbox_messages WHERE mailbox_id = ?1",
         [mailbox_id],
     )?;
-    for message_id in ids {
-        transaction.execute(
-            "DELETE FROM messages
-             WHERE id = ?1
-               AND NOT EXISTS (SELECT 1 FROM mailbox_messages WHERE message_id = ?1)",
-            [&message_id],
-        )?;
-    }
     Ok(())
 }
 
+// Identity, content, thread, and membership writes are one atomic import unit.
+#[allow(clippy::too_many_lines)]
 fn upsert_header<T>(
     transaction: &T,
     account_id: &str,
@@ -421,17 +545,105 @@ fn upsert_header<T>(
 where
     T: Deref<Target = Connection>,
 {
-    let message_row_id = message_id(mailbox_id, uid_validity, header.uid);
+    let canonical_message_id = header.message_id.as_deref().and_then(canonical_message_id);
+    let recipients_json = serde_json::to_string(&header.recipients)?;
+    let cc_json = serde_json::to_string(&header.cc)?;
+    let content_json = header
+        .content
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let fingerprint = serde_json::to_string(&(
+        &header.subject,
+        &header.sender,
+        header.sent_at,
+        &header.recipients,
+        &header.cc,
+    ))?;
+    let membership_message_id = transaction
+        .query_row(
+            "SELECT message_id FROM mailbox_messages
+             WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3",
+            params![mailbox_id, i64::from(uid_validity), i64::from(header.uid)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let provider_match = header
+        .provider_message_id
+        .as_deref()
+        .map(|provider_id| {
+            transaction
+                .query_row(
+                    "SELECT id FROM messages
+                     WHERE account_id = ?1 AND provider_message_id = ?2
+                     ORDER BY id LIMIT 1",
+                    params![account_id, provider_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .transpose()?
+        .flatten();
+    let generic_match = if header.provider_message_id.is_none() && content_json.is_some() {
+        canonical_message_id
+            .as_deref()
+            .map(|canonical| {
+                transaction
+                    .query_row(
+                        "SELECT id FROM messages
+                         WHERE account_id = ?1
+                           AND canonical_message_id = ?2
+                           AND header_fingerprint = ?3 AND content_json = ?4
+                         ORDER BY id LIMIT 1",
+                        params![account_id, canonical, fingerprint, content_json],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let message_row_id = membership_message_id
+        .or(provider_match)
+        .or(generic_match)
+        .unwrap_or_else(|| message_id(mailbox_id, uid_validity, header.uid));
+    let thread_id = resolve_thread(
+        transaction,
+        account_id,
+        &message_row_id,
+        canonical_message_id.as_deref(),
+        &fingerprint,
+        header,
+    )?;
     transaction.execute(
         "INSERT INTO messages
-            (id, account_id, message_id_header, subject, sender, date, snippet, has_attachments)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0)
+            (id, account_id, message_id_header, subject, sender, date, snippet,
+             has_attachments, thread_id, canonical_message_id, recipients_json,
+             cc_json, sent_at, provider_message_id, provider_thread_id, content_json,
+             header_fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17)
          ON CONFLICT(id) DO UPDATE SET
             account_id = excluded.account_id,
             message_id_header = excluded.message_id_header,
             subject = excluded.subject,
             sender = excluded.sender,
-            date = excluded.date",
+            date = excluded.date,
+            snippet = CASE WHEN excluded.content_json IS NULL
+                           THEN messages.snippet ELSE excluded.snippet END,
+            has_attachments = CASE WHEN excluded.content_json IS NULL
+                                   THEN messages.has_attachments ELSE excluded.has_attachments END,
+            thread_id = excluded.thread_id,
+            canonical_message_id = excluded.canonical_message_id,
+            recipients_json = excluded.recipients_json,
+            cc_json = excluded.cc_json,
+            sent_at = excluded.sent_at,
+            provider_message_id = excluded.provider_message_id,
+            provider_thread_id = excluded.provider_thread_id,
+            content_json = COALESCE(excluded.content_json, messages.content_json),
+            header_fingerprint = excluded.header_fingerprint",
         params![
             message_row_id,
             account_id,
@@ -439,16 +651,65 @@ where
             header.subject,
             header.sender,
             header.date,
+            header
+                .content
+                .as_ref()
+                .map(|content| content.plain_text.chars().take(240).collect::<String>())
+                .unwrap_or_default(),
+            i64::from(u8::from(
+                header
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| !content.attachments.is_empty())
+            )),
+            thread_id,
+            canonical_message_id,
+            recipients_json,
+            cc_json,
+            header.sent_at,
+            header.provider_message_id,
+            header.provider_thread_id,
+            content_json,
+            fingerprint,
         ],
+    )?;
+    let moved_away = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pending_operations
+             WHERE mailbox_id = ?1 AND message_id = ?2 AND uid_validity = ?3
+               AND remote_uid = ?4 AND action = 'move'
+               AND state IN ('pending', 'failed', 'completed')
+         )",
+        params![
+            mailbox_id,
+            message_row_id,
+            i64::from(uid_validity),
+            i64::from(header.uid)
+        ],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )?;
+    if moved_away {
+        transaction.execute(
+            "DELETE FROM mailbox_messages
+             WHERE mailbox_id = ?1 AND uid_validity = ?2 AND remote_uid = ?3",
+            params![mailbox_id, i64::from(uid_validity), i64::from(header.uid)],
+        )?;
+        return Ok(());
+    }
+    transaction.execute(
+        "DELETE FROM mailbox_messages
+         WHERE mailbox_id = ?1 AND message_id = ?2 AND local_only = 1",
+        params![mailbox_id, message_row_id],
     )?;
     transaction.execute(
         "INSERT INTO mailbox_messages
-            (mailbox_id, message_id, uid_validity, remote_uid, is_read, is_starred)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (mailbox_id, message_id, uid_validity, remote_uid, is_read, is_starred, local_only)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
          ON CONFLICT(mailbox_id, uid_validity, remote_uid) DO UPDATE SET
             message_id = excluded.message_id,
             is_read = excluded.is_read,
-            is_starred = excluded.is_starred",
+            is_starred = excluded.is_starred,
+            local_only = 0",
         params![
             mailbox_id,
             message_row_id,
@@ -458,6 +719,322 @@ where
             i64::from(u8::from(header.is_starred)),
         ],
     )?;
+    reapply_membership_overlays(
+        transaction,
+        mailbox_id,
+        &message_row_id,
+        uid_validity,
+        header.uid,
+    )?;
+    Ok(())
+}
+
+// Candidate discovery and component merging must remain one deterministic path.
+#[allow(clippy::too_many_lines)]
+fn resolve_thread<T>(
+    transaction: &T,
+    account_id: &str,
+    message_row_id: &str,
+    canonical_id: Option<&str>,
+    fingerprint: &str,
+    header: &RemoteHeader,
+) -> Result<String>
+where
+    T: Deref<Target = Connection>,
+{
+    let existing_thread = transaction
+        .query_row(
+            "SELECT thread_id FROM messages WHERE id = ?1",
+            [message_row_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
+    let conflicting_duplicate = canonical_id
+        .map(|id| {
+            transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages
+                     WHERE account_id = ?1 AND canonical_message_id = ?2
+                       AND id <> ?3 AND header_fingerprint <> ?4
+                 )",
+                params![account_id, id, message_row_id, fingerprint],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if conflicting_duplicate {
+        if let Some(id) = canonical_id {
+            transaction.execute(
+                "DELETE FROM thread_keys WHERE account_id = ?1 AND key = ?2",
+                params![account_id, message_key(id)],
+            )?;
+        }
+    }
+
+    let mut relation_ids = header
+        .references
+        .iter()
+        .chain(&header.in_reply_to)
+        .flat_map(|value| message_ids_in(value))
+        .filter(|id| Some(id.as_str()) != canonical_id)
+        .collect::<Vec<_>>();
+    relation_ids.sort();
+    relation_ids.dedup();
+    relation_ids.retain(|id| !message_id_is_ambiguous(transaction, account_id, id).unwrap_or(true));
+    if conflicting_duplicate {
+        relation_ids.clear();
+    }
+
+    let provider_key = header
+        .provider_thread_id
+        .as_deref()
+        .map(|id| format!("provider:{id}"));
+    let own_key = canonical_id.map(message_key);
+    let own_alias = own_key
+        .as_deref()
+        .map(|key| thread_for_key(transaction, account_id, key))
+        .transpose()?
+        .flatten();
+    let mut candidates = Vec::new();
+    if let Some(thread_id) = existing_thread {
+        candidates.push(thread_id);
+    }
+    if let Some(key) = provider_key.as_deref() {
+        if let Some(thread_id) = thread_for_key(transaction, account_id, key)? {
+            candidates.push(thread_id);
+        }
+    }
+    for relation in &relation_ids {
+        if let Some(thread_id) = thread_for_key(transaction, account_id, &message_key(relation))? {
+            candidates.push(thread_id);
+        }
+    }
+    if let Some(alias) = own_alias {
+        if !conflicting_duplicate {
+            candidates.push(alias);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let thread_id = if candidates.is_empty() {
+        let id = format!("thr:{}:{}", account_id.len(), message_row_id);
+        transaction.execute(
+            "INSERT OR IGNORE INTO threads (id, account_id) VALUES (?1, ?2)",
+            params![id, account_id],
+        )?;
+        id
+    } else {
+        let winner = oldest_thread(transaction, &candidates)?;
+        for loser in candidates.iter().filter(|candidate| *candidate != &winner) {
+            transaction.execute(
+                "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
+                params![winner, loser],
+            )?;
+            transaction.execute(
+                "UPDATE OR REPLACE thread_keys SET thread_id = ?1 WHERE thread_id = ?2",
+                params![winner, loser],
+            )?;
+            transaction.execute("DELETE FROM threads WHERE id = ?1", [loser])?;
+        }
+        winner
+    };
+
+    if let Some(key) = provider_key {
+        bind_thread_key(transaction, account_id, &key, &thread_id)?;
+    }
+    if !conflicting_duplicate {
+        if let Some(key) = own_key {
+            bind_thread_key(transaction, account_id, &key, &thread_id)?;
+        }
+    }
+    for relation in relation_ids {
+        bind_thread_key(transaction, account_id, &message_key(&relation), &thread_id)?;
+    }
+    Ok(thread_id)
+}
+
+fn oldest_thread<T>(transaction: &T, candidates: &[String]) -> Result<String>
+where
+    T: Deref<Target = Connection>,
+{
+    let mut winner = candidates[0].clone();
+    let mut winner_rowid = i64::MAX;
+    for candidate in candidates {
+        let rowid = transaction.query_row(
+            "SELECT rowid FROM threads WHERE id = ?1",
+            [candidate],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if rowid < winner_rowid {
+            winner.clone_from(candidate);
+            winner_rowid = rowid;
+        }
+    }
+    Ok(winner)
+}
+
+fn bind_thread_key<T>(transaction: &T, account_id: &str, key: &str, thread_id: &str) -> Result<()>
+where
+    T: Deref<Target = Connection>,
+{
+    transaction.execute(
+        "INSERT INTO thread_keys (account_id, key, thread_id)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(account_id, key) DO NOTHING",
+        params![account_id, key, thread_id],
+    )?;
+    Ok(())
+}
+
+fn thread_for_key<T>(transaction: &T, account_id: &str, key: &str) -> Result<Option<String>>
+where
+    T: Deref<Target = Connection>,
+{
+    transaction
+        .query_row(
+            "SELECT thread_id FROM thread_keys WHERE account_id = ?1 AND key = ?2",
+            params![account_id, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)
+}
+
+fn message_id_is_ambiguous<T>(transaction: &T, account_id: &str, id: &str) -> Result<bool>
+where
+    T: Deref<Target = Connection>,
+{
+    transaction
+        .query_row(
+            "SELECT COUNT(DISTINCT header_fingerprint) > 1
+             FROM messages WHERE account_id = ?1 AND canonical_message_id = ?2",
+            params![account_id, id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .map_err(DatabaseError::from)
+}
+
+fn message_key(id: &str) -> String {
+    format!("message:{id}")
+}
+
+fn message_ids_in(value: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut remainder = value;
+    while let Some(start) = remainder.find('<') {
+        let after_start = &remainder[start..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        if let Some(id) = canonical_message_id(&after_start[..=end]) {
+            ids.push(id);
+        }
+        remainder = &after_start[end + 1..];
+    }
+    if ids.is_empty() {
+        if let Some(id) = canonical_message_id(value) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn canonical_message_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let inner = if let Some(inner) = trimmed
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        inner
+    } else if !trimmed.contains(['<', '>']) {
+        trimmed
+    } else {
+        return None;
+    };
+    if inner.is_empty()
+        || inner.chars().any(char::is_whitespace)
+        || inner.contains(['<', '>'])
+        || inner.matches('@').count() != 1
+    {
+        return None;
+    }
+    let (local, domain) = inner.split_once('@')?;
+    let local = local
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(local);
+    if local.is_empty() || domain.is_empty() {
+        return None;
+    }
+    Some(format!("<{local}@{}>", domain.to_ascii_lowercase()))
+}
+
+fn reapply_membership_overlays<T>(
+    transaction: &T,
+    mailbox_id: &str,
+    message_id: &str,
+    uid_validity: u32,
+    remote_uid: u32,
+) -> Result<()>
+where
+    T: Deref<Target = Connection>,
+{
+    let mut statement = transaction.prepare(
+        "SELECT action FROM pending_operations
+         WHERE mailbox_id = ?1 AND message_id = ?2
+           AND uid_validity = ?3 AND remote_uid = ?4
+           AND state IN ('pending', 'failed')
+         ORDER BY id",
+    )?;
+    let actions = statement
+        .query_map(
+            params![
+                mailbox_id,
+                message_id,
+                i64::from(uid_validity),
+                i64::from(remote_uid)
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for action in actions {
+        match action.as_str() {
+            "mark_read" => {
+                transaction.execute(
+                    "UPDATE mailbox_messages SET is_read = 1
+                     WHERE mailbox_id = ?1 AND message_id = ?2",
+                    params![mailbox_id, message_id],
+                )?;
+            }
+            "mark_unread" => {
+                transaction.execute(
+                    "UPDATE mailbox_messages SET is_read = 0
+                     WHERE mailbox_id = ?1 AND message_id = ?2",
+                    params![mailbox_id, message_id],
+                )?;
+            }
+            "star" => {
+                transaction.execute(
+                    "UPDATE mailbox_messages SET is_starred = 1
+                     WHERE mailbox_id = ?1 AND message_id = ?2",
+                    params![mailbox_id, message_id],
+                )?;
+            }
+            "unstar" => {
+                transaction.execute(
+                    "UPDATE mailbox_messages SET is_starred = 0
+                     WHERE mailbox_id = ?1 AND message_id = ?2",
+                    params![mailbox_id, message_id],
+                )?;
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
