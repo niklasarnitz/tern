@@ -7,7 +7,9 @@
 use std::{collections::HashMap, ops::Deref, path::Path};
 
 use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
-use rusqlite::{params, params_from_iter, types::Type, types::Value, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, types::Type, types::Value, Connection, OptionalExtension,
+};
 
 mod conversations;
 mod mutations;
@@ -339,7 +341,8 @@ impl Database {
         let plan = search::parse(query)?;
         let limit = limit.min(MAX_PAGE_SIZE);
         let mut sql = String::from(
-            "SELECT msg.id, MIN(mm.mailbox_id), MAX(mm.remote_uid),
+            "SELECT msg.id, MIN(mm.mailbox_id),
+                    MAX(CASE WHEN mm.local_only = 1 THEN 0 ELSE mm.remote_uid END),
                     msg.subject, msg.sender, msg.date, msg.snippet,
                     MIN(mm.is_read), MAX(mm.is_starred), msg.has_attachments
              FROM mailbox_messages AS mm
@@ -1791,6 +1794,10 @@ mod tests {
             .unwrap();
         assert!(db.list_messages(&inbox.id, 0, 10).unwrap().is_empty());
         assert_eq!(db.list_messages(&archive.id, 0, 10).unwrap().len(), 1);
+        assert_eq!(
+            db.search_messages("in:Archive", 0, 10).unwrap()[0].remote_uid,
+            0
+        );
         let mut confirmed = original;
         confirmed.uid = 40;
         db.apply_snapshot(
