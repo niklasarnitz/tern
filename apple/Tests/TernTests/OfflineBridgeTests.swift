@@ -62,6 +62,56 @@ final class OfflineBridgeTests: XCTestCase {
         XCTAssertTrue(beyondEnd.isEmpty)
     }
 
+    func testWidgetSnapshotIsBoundedToExplicitMailboxSelection() throws {
+        let path = try XCTUnwrap(ProcessInfo.processInfo.environment["TERN_TEST_DATABASE"])
+        let client = try MailClient(databasePath: path)
+        let mailbox = try XCTUnwrap(try client.listMailboxes(accountId: "fixture").first)
+
+        let empty = try client.widgetSnapshot(mailboxIds: [], importantLimit: 20)
+        XCTAssertEqual(empty.unreadCount, 0)
+        XCTAssertTrue(empty.mailboxes.isEmpty)
+        XCTAssertTrue(empty.importantMessages.isEmpty)
+
+        let selected = try client.widgetSnapshot(mailboxIds: [mailbox.id], importantLimit: 20)
+        XCTAssertEqual(selected.unreadCount, 53)
+        XCTAssertEqual(selected.mailboxes.first?.id, mailbox.id)
+        XCTAssertLessThanOrEqual(selected.importantMessages.count, 10)
+    }
+
+    func testWidgetPrivacyRemovesUnapprovedMessageContent() throws {
+        let defaults = WidgetDataStore.defaults
+        let previous = defaults.data(forKey: WidgetDataStore.snapshotKey)
+        defer { defaults.set(previous, forKey: WidgetDataStore.snapshotKey) }
+        let snapshot = WidgetSnapshot(
+            unreadCount: 4,
+            mailboxes: [WidgetMailboxSummary(id: "inbox", displayName: "Inbox", unreadCount: 4)],
+            importantMessages: [
+                MessageSummary(
+                    id: "message",
+                    mailboxId: "inbox",
+                    remoteUid: 7,
+                    subject: "Private subject",
+                    sender: "Private sender",
+                    date: "2026-09-18",
+                    snippet: "Private preview",
+                    isRead: false,
+                    isStarred: true,
+                    hasAttachments: false
+                ),
+            ]
+        )
+
+        try WidgetDataStore.cache(snapshot, privacy: .countsOnly)
+        XCTAssertTrue(WidgetDataStore.snapshot().importantMessages.isEmpty)
+
+        try WidgetDataStore.cache(snapshot, privacy: .senderAndSubject)
+        XCTAssertEqual(WidgetDataStore.snapshot().importantMessages.first?.subject, "Private subject")
+        XCTAssertNil(WidgetDataStore.snapshot().importantMessages.first?.snippet)
+
+        try WidgetDataStore.cache(snapshot, privacy: .fullPreview)
+        XCTAssertEqual(WidgetDataStore.snapshot().importantMessages.first?.snippet, "Private preview")
+    }
+
     @MainActor
     func testNativeStorePagesWithoutAccumulatingMessages() async {
         let store = MailStore()

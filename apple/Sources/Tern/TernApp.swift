@@ -21,6 +21,75 @@ struct TernApp: App {
                 .disabled(!store.canRefresh)
             }
         }
+        Settings {
+            WidgetSettingsView(store: store)
+        }
+    }
+}
+
+private struct WidgetSettingsView: View {
+    @ObservedObject var store: MailStore
+
+    var body: some View {
+        Form {
+            Section("Privacy") {
+                Picker("Show on widgets", selection: privacyBinding) {
+                    ForEach(WidgetPrivacy.allCases) { privacy in
+                        Text(privacy.title).tag(privacy)
+                    }
+                }
+                Text(
+                    "Counts only is the default. More private mail content is copied to the widget cache " +
+                        "only when you allow it."
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Selected Mailboxes") {
+                if store.mailboxes.isEmpty {
+                    Text("Open an account to choose mailboxes.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.mailboxes, id: \.id) { mailbox in
+                        Toggle(
+                            mailbox.displayName.isEmpty ? mailbox.remoteName : mailbox.displayName,
+                            isOn: mailboxBinding(mailbox.id)
+                        )
+                    }
+                }
+                Text("Widgets read only the mailboxes selected here. No mailbox is shared by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let error = store.widgetErrorMessage {
+                Section {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480, height: 420)
+    }
+
+    private var privacyBinding: Binding<WidgetPrivacy> {
+        Binding(
+            get: { store.widgetPrivacy },
+            set: { privacy in
+                Task { await store.setWidgetPrivacy(privacy) }
+            }
+        )
+    }
+
+    private func mailboxBinding(_ mailboxID: String) -> Binding<Bool> {
+        Binding(
+            get: { store.isMailboxIncludedInWidgets(mailboxID) },
+            set: { included in
+                Task { await store.setMailbox(mailboxID, includedInWidgets: included) }
+            }
+        )
     }
 }
 

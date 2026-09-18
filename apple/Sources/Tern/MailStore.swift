@@ -29,6 +29,10 @@ private actor MailCoreActor {
     func searchMessages(query: String, offset: UInt32, limit: UInt32) throws -> [MessageSummary] {
         try client.searchMessages(query: query, offset: offset, limit: limit)
     }
+
+    func widgetSnapshot(mailboxIDs: [String], importantLimit: UInt32) throws -> WidgetSnapshot {
+        try client.widgetSnapshot(mailboxIds: mailboxIDs, importantLimit: importantLimit)
+    }
 }
 
 @MainActor
@@ -41,6 +45,9 @@ final class MailStore: ObservableObject {
     @Published private(set) var isLoadingMailboxes = false
     @Published private(set) var isLoadingMessages = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var widgetErrorMessage: String?
+    @Published private(set) var widgetPrivacy = WidgetDataStore.privacy()
+    @Published private(set) var widgetMailboxIDs = WidgetDataStore.selectedMailboxIDs()
     @Published var selectedAccountID: String?
     @Published var selectedMailboxID: String?
     @Published var selectedMessageID: String?
@@ -235,6 +242,26 @@ final class MailStore: ObservableObject {
         await loadMessages(mailboxID: mailboxID, offset: 0, using: core)
     }
 
+    func setWidgetPrivacy(_ privacy: WidgetPrivacy) async {
+        widgetPrivacy = privacy
+        WidgetDataStore.setPrivacy(privacy)
+        await publishWidgetSnapshot()
+    }
+
+    func setMailbox(_ mailboxID: String, includedInWidgets: Bool) async {
+        if includedInWidgets {
+            widgetMailboxIDs.insert(mailboxID)
+        } else {
+            widgetMailboxIDs.remove(mailboxID)
+        }
+        WidgetDataStore.setSelectedMailboxIDs(widgetMailboxIDs)
+        await publishWidgetSnapshot()
+    }
+
+    func isMailboxIncludedInWidgets(_ mailboxID: String) -> Bool {
+        widgetMailboxIDs.contains(mailboxID)
+    }
+
     private func loadAccounts() async {
         guard let core else { return }
         let generation = requestGeneration
@@ -256,6 +283,7 @@ final class MailStore: ObservableObject {
             } else {
                 await loadMailboxes(for: account)
             }
+            await publishWidgetSnapshot()
         } catch {
             if generation == requestGeneration {
                 isLoadingAccounts = false
@@ -349,6 +377,20 @@ final class MailStore: ObservableObject {
 
     private func setSidebarSelection(_ item: SidebarItem) {
         selectedSidebarItem = item
+    }
+
+    private func publishWidgetSnapshot() async {
+        guard let core else { return }
+        do {
+            let snapshot = try await core.widgetSnapshot(
+                mailboxIDs: widgetMailboxIDs.sorted(),
+                importantLimit: 5
+            )
+            try WidgetDataStore.cache(snapshot, privacy: widgetPrivacy)
+            widgetErrorMessage = nil
+        } catch {
+            widgetErrorMessage = Self.message(for: error)
+        }
     }
 
     private static func message(for error: Error) -> String {

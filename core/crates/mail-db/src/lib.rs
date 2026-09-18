@@ -6,7 +6,10 @@
 
 use std::{collections::HashMap, ops::Deref, path::Path};
 
-use mail_model::{Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader};
+use mail_model::{
+    Account, Mailbox, MailboxSnapshot, MessageSummary, RemoteHeader, WidgetMailboxSummary,
+    WidgetSnapshot,
+};
 use rusqlite::{
     params, params_from_iter, types::Type, types::Value, Connection, OptionalExtension,
 };
@@ -19,6 +22,8 @@ const SCHEMA_VERSION: i64 = 4;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
+pub const MAX_WIDGET_MAILBOXES: usize = 20;
+pub const MAX_WIDGET_MESSAGES: u32 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -401,7 +406,8 @@ impl Database {
         values.push(Value::Integer(i64::from(offset)));
 
         let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(values.iter()), message_summary_from_row)?;
+        let rows =
+            statement.query_map(params_from_iter(values.iter()), message_summary_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }
@@ -448,6 +454,105 @@ fn message_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message
         is_starred: row.get::<_, i64>(8)? != 0,
         has_attachments: row.get::<_, i64>(9)? != 0,
     })
+}
+
+impl Database {
+    /// Read a bounded summary for widgets from explicitly selected mailboxes.
+    ///
+    /// Unknown mailbox ids are ignored. An empty selection returns no counts
+    /// or message metadata, so a widget cannot accidentally broaden its scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot read the selected cached rows.
+    pub fn widget_snapshot(
+        &self,
+        mailbox_ids: &[String],
+        important_limit: u32,
+    ) -> Result<WidgetSnapshot> {
+        let mut selected_ids = mailbox_ids.to_vec();
+        selected_ids.sort();
+        selected_ids.dedup();
+        selected_ids.truncate(MAX_WIDGET_MAILBOXES);
+
+        let mut mailboxes = Vec::new();
+        for mailbox_id in &selected_ids {
+            let summary = self
+                .connection
+                .query_row(
+                    "SELECT mb.id, mb.display_name, COUNT(mm.message_id)
+                     FROM mailboxes AS mb
+                     LEFT JOIN mailbox_messages AS mm
+                       ON mm.mailbox_id = mb.id
+                      AND mm.uid_validity = mb.uid_validity
+                      AND mm.is_read = 0
+                     WHERE mb.id = ?1
+                     GROUP BY mb.id, mb.display_name",
+                    [mailbox_id],
+                    |row| {
+                        Ok(WidgetMailboxSummary {
+                            id: row.get(0)?,
+                            display_name: row.get(1)?,
+                            unread_count: u32_from_sql(row.get::<_, i64>(2)?, 2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(summary) = summary {
+                mailboxes.push(summary);
+            }
+        }
+
+        let unread_count = mailboxes.iter().try_fold(0_u32, |total, mailbox| {
+            total.checked_add(mailbox.unread_count).ok_or_else(|| {
+                DatabaseError::Sqlite(rusqlite::Error::IntegralValueOutOfRange(2, i64::MAX))
+            })
+        })?;
+        let important_limit = important_limit.min(MAX_WIDGET_MESSAGES);
+        let important_messages = if selected_ids.is_empty() || important_limit == 0 {
+            Vec::new()
+        } else {
+            let placeholders = std::iter::repeat_n("?", selected_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT msg.id, mm.mailbox_id, mm.remote_uid,
+                        msg.subject, msg.sender, msg.date, msg.snippet,
+                        mm.is_read, mm.is_starred, msg.has_attachments
+                 FROM mailbox_messages AS mm
+                 JOIN mailboxes AS mb ON mb.id = mm.mailbox_id
+                 JOIN messages AS msg ON msg.id = mm.message_id
+                 WHERE mm.mailbox_id IN ({placeholders})
+                   AND mb.uid_validity IS NOT NULL
+                   AND mm.uid_validity = mb.uid_validity
+                   AND mm.is_starred = 1
+                 ORDER BY msg.date DESC, mm.remote_uid DESC
+                 LIMIT {important_limit}"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(&selected_ids), |row| {
+                Ok(MessageSummary {
+                    id: row.get(0)?,
+                    mailbox_id: row.get(1)?,
+                    remote_uid: u32_from_sql(row.get::<_, i64>(2)?, 2)?,
+                    subject: row.get(3)?,
+                    sender: row.get(4)?,
+                    date: row.get(5)?,
+                    snippet: row.get(6)?,
+                    is_read: row.get::<_, i64>(7)? != 0,
+                    is_starred: row.get::<_, i64>(8)? != 0,
+                    has_attachments: row.get::<_, i64>(9)? != 0,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        Ok(WidgetSnapshot {
+            unread_count,
+            mailboxes,
+            important_messages,
+        })
+    }
 }
 
 // Schema text stays together so each migration transaction is reviewable.
@@ -1507,6 +1612,46 @@ mod tests {
     }
 
     #[test]
+    fn widget_snapshot_uses_only_selected_mailboxes_and_is_bounded() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1, 2, 3, 6]))
+            .unwrap();
+        db.apply_snapshot("one", &snapshot("Archive", 1, &[9, 10, 12]))
+            .unwrap();
+        let mailboxes = db.list_mailboxes("one").unwrap();
+        let inbox = mailboxes
+            .iter()
+            .find(|mailbox| mailbox.remote_name == "INBOX")
+            .unwrap();
+
+        let widget = db
+            .widget_snapshot(&[inbox.id.clone(), inbox.id.clone(), "missing".into()], 1)
+            .unwrap();
+
+        assert_eq!(widget.unread_count, 2);
+        assert_eq!(widget.mailboxes.len(), 1);
+        assert_eq!(widget.mailboxes[0].display_name, "INBOX");
+        assert_eq!(widget.mailboxes[0].unread_count, 2);
+        assert_eq!(widget.important_messages.len(), 1);
+        assert_eq!(widget.important_messages[0].remote_uid, 6);
+    }
+
+    #[test]
+    fn empty_widget_selection_does_not_expose_cached_mail() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        db.apply_snapshot("one", &snapshot("INBOX", 1, &[1, 3]))
+            .unwrap();
+
+        let widget = db.widget_snapshot(&[], MAX_WIDGET_MESSAGES + 1).unwrap();
+
+        assert_eq!(widget.unread_count, 0);
+        assert!(widget.mailboxes.is_empty());
+        assert!(widget.important_messages.is_empty());
+    }
+
+    #[test]
     fn oversized_snapshot_is_rejected_without_changing_cached_rows() {
         let db = Database::open(":memory:").unwrap();
         db.upsert_account(&account("one")).unwrap();
@@ -2370,9 +2515,15 @@ mod tests {
         assert_eq!(results[0].snippet, "The launch plan is ready.");
         assert!(results[0].has_attachments);
 
-        assert_eq!(db.search_messages("subject:budget", 0, 20).unwrap().len(), 1);
+        assert_eq!(
+            db.search_messages("subject:budget", 0, 20).unwrap().len(),
+            1
+        );
         assert_eq!(db.search_messages("in:Archive", 0, 20).unwrap().len(), 1);
-        assert_eq!(db.search_messages("account:personal", 0, 20).unwrap().len(), 1);
+        assert_eq!(
+            db.search_messages("account:personal", 0, 20).unwrap().len(),
+            1
+        );
         assert_eq!(db.search_messages("roadmap", 0, 20).unwrap().len(), 2);
     }
 

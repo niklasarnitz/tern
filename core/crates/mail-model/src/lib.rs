@@ -34,6 +34,20 @@ pub struct MessageSummary {
     pub has_attachments: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct WidgetMailboxSummary {
+    pub id: String,
+    pub display_name: String,
+    pub unread_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, uniffi::Record)]
+pub struct WidgetSnapshot {
+    pub unread_count: u32,
+    pub mailboxes: Vec<WidgetMailboxSummary>,
+    pub important_messages: Vec<MessageSummary>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct Attachment {
     pub id: String,

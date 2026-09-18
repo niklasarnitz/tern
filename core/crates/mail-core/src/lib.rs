@@ -1,6 +1,6 @@
 //! Stable application boundary exposed to native frontends via `UniFFI`.
 use mail_db::Database;
-use mail_model::{Account, Mailbox, MessageSummary};
+use mail_model::{Account, Mailbox, MessageSummary, WidgetSnapshot};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -87,6 +87,22 @@ impl MailClient {
             .lock()
             .map_err(storage)?
             .search_messages(&query, offset, limit)
+            .map_err(storage)
+    }
+
+    /// Read bounded widget data for explicitly selected mailboxes.
+    ///
+    /// # Errors
+    /// Returns a storage error if the database cannot be read.
+    pub fn widget_snapshot(
+        &self,
+        mailbox_ids: Vec<String>,
+        important_limit: u32,
+    ) -> Result<WidgetSnapshot, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .widget_snapshot(&mailbox_ids, important_limit)
             .map_err(storage)
     }
 }
