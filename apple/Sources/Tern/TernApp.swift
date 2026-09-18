@@ -13,6 +13,13 @@ struct TernApp: App {
                 }
         }
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button(store.pendingUndo.map { "Undo \($0.actionLabel)" } ?? "Undo") {
+                    Task { await store.undoLastAction() }
+                }
+                .keyboardShortcut("z", modifiers: [.command])
+                .disabled(store.pendingUndo == nil)
+            }
             CommandGroup(after: .sidebar) {
                 Button("Reload Cache") {
                     Task { await store.refresh() }
@@ -113,6 +120,16 @@ private struct MailRootView: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) {
+            if let notice = store.pendingUndo {
+                UndoBanner(actionLabel: notice.actionLabel) {
+                    Task { await store.undoLastAction() }
+                }
+                .padding(.bottom, 16)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: store.pendingUndo)
     }
 }
 
@@ -203,6 +220,9 @@ private struct MessageListView: View {
                 List(store.messages, id: \.id, selection: $store.selectedMessageID) { message in
                     MessageRow(message: message)
                         .tag(message.id as String?)
+                        .contextMenu {
+                            MessageActionButtons(store: store, message: message)
+                        }
                 }
                 .listStyle(.inset)
             }
@@ -224,6 +244,11 @@ private struct MessageListView: View {
             }
         }
         .toolbar {
+            ToolbarItemGroup {
+                if let message = store.selectedMessage {
+                    MessageActionButtons(store: store, message: message)
+                }
+            }
             ToolbarItem {
                 Button {
                     Task { await store.refresh() }
@@ -267,6 +292,58 @@ private struct MessageListView: View {
         let last = store.messageOffset + UInt32(store.messages.count)
         let noun = store.isSearching ? "Results" : "Messages"
         return "\(noun) \(first)–\(last)"
+    }
+}
+
+private struct MessageActionButtons: View {
+    @ObservedObject var store: MailStore
+    let message: MessageSummary
+
+    var body: some View {
+        if let archive = store.archiveMailbox {
+            actionButton("Archive", systemImage: "archivebox", destination: archive, result: "Archived")
+        }
+        if let trash = store.trashMailbox {
+            actionButton("Delete", systemImage: "trash", destination: trash, result: "Deleted")
+        }
+        if let spam = store.spamMailbox {
+            actionButton(
+                "Mark as Spam",
+                systemImage: "exclamationmark.octagon",
+                destination: spam,
+                result: "Marked as Spam"
+            )
+        }
+        if !store.moveDestinations.isEmpty {
+            Menu {
+                ForEach(store.moveDestinations, id: \.id) { mailbox in
+                    Button(mailbox.displayName.isEmpty ? mailbox.remoteName : mailbox.displayName) {
+                        move(to: mailbox, result: "Moved")
+                    }
+                }
+            } label: {
+                Label("Move to", systemImage: "folder")
+            }
+            .disabled(store.isPerformingAction)
+        }
+    }
+
+    private func actionButton(
+        _ title: String,
+        systemImage: String,
+        destination: Mailbox,
+        result: String
+    ) -> some View {
+        Button {
+            move(to: destination, result: result)
+        } label: {
+            Label(title, systemImage: systemImage)
+        }
+        .disabled(store.isPerformingAction)
+    }
+
+    private func move(to mailbox: Mailbox, result: String) {
+        Task { await store.moveMessage(message, to: mailbox, actionLabel: result) }
     }
 }
 
@@ -499,5 +576,24 @@ private struct ErrorOverlay: View {
         .frame(maxWidth: 360)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .shadow(radius: 12)
+    }
+}
+
+private struct UndoBanner: View {
+    let actionLabel: String
+    let undo: () -> Void
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Text("\(actionLabel).")
+                .lineLimit(1)
+            Button("Undo", action: undo)
+                .keyboardShortcut("z", modifiers: [.command])
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(radius: 8, y: 3)
+        .accessibilityElement(children: .combine)
     }
 }

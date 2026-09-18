@@ -129,5 +129,43 @@ impl MailClient {
             .widget_snapshot(&mailbox_ids, important_limit)
             .map_err(storage)
     }
+
+    /// Optimistically move a cached message and keep it undoable until the deadline.
+    ///
+    /// The operation remains local until a later authenticated synchronization
+    /// claims it after `undo_deadline_ms`.
+    ///
+    /// # Errors
+    /// Returns a storage error if the source or destination is unavailable.
+    pub fn queue_message_move(
+        &self,
+        mailbox_id: String,
+        message_id: String,
+        destination_mailbox_id: String,
+        undo_deadline_ms: i64,
+    ) -> Result<String, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .queue_move(
+                &mailbox_id,
+                &message_id,
+                &destination_mailbox_id,
+                undo_deadline_ms,
+            )
+            .map_err(storage)
+    }
+
+    /// Cancel a local operation before synchronization claims it.
+    ///
+    /// # Errors
+    /// Returns a storage error if the operation queue cannot be updated.
+    pub fn undo_operation(&self, operation_id: String) -> Result<bool, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .undo_operation(&operation_id)
+            .map_err(storage)
+    }
 }
 uniffi::setup_scaffolding!();

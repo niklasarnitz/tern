@@ -28,10 +28,7 @@ pub(super) fn parse(query: &str) -> Result<SearchPlan> {
         }
         match operator.to_ascii_lowercase().as_str() {
             "from" => fts_terms.push(format!("sender:{}", fts_phrase(value))),
-            "to" => fts_terms.push(format!(
-                "{{recipients_json cc_json}}:{}",
-                fts_phrase(value)
-            )),
+            "to" => fts_terms.push(format!("{{recipients_json cc_json}}:{}", fts_phrase(value))),
             "subject" => fts_terms.push(format!("subject:{}", fts_phrase(value))),
             "before" => plan.before.push(date_timestamp(operator, value)?),
             "after" => plan.after.push(date_timestamp(operator, value)?),

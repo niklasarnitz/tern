@@ -4,7 +4,7 @@ use mail_model::{Account, Mailbox};
 use std::{
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_ATTEMPTS: u32 = 4;
@@ -30,8 +30,13 @@ pub enum SyncError {
     Sync(String),
 }
 
-/// Fetch fully before opening a `SQLite` transaction. A network failure leaves the
-/// previous offline snapshot readable. This first slice syncs Inbox headers only.
+/// Discover mailboxes, replay expired durable moves, and fetch Inbox headers.
+///
+/// Each move is claimed in a short local transaction before network work and is
+/// attempted once. An ambiguous replay failure remains durable for later
+/// reconciliation rather than being issued again automatically. Read-only
+/// discovery and snapshot failures use bounded transient retries and leave the
+/// previous offline snapshot readable; cache writes happen only afterward.
 ///
 /// # Errors
 /// Returns an error if credentials, the server, TLS or local persistence fail.
@@ -41,11 +46,37 @@ pub async fn sync_inbox(
     credentials: &dyn CredentialProvider,
 ) -> Result<Mailbox, SyncError> {
     let password = credentials.password(&account.credential_ref)?;
+    let remote_mailboxes = retry_transient(account, || {
+        mail_imap::list_remote_mailboxes(account, &password)
+    })
+    .await
+    .map_err(|e| SyncError::Sync(e.to_string()))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    let operations = db
+        .claim_due_operations(&account.id, now_ms)
+        .map_err(|e| SyncError::Sync(e.to_string()))?;
+    for operation in operations {
+        if let Err(error) = mail_imap::apply_operation(account, &password, &operation).await {
+            db.fail_operation(&operation.id, &error.to_string())
+                .map_err(|e| SyncError::Sync(e.to_string()))?;
+            return Err(SyncError::Sync(error.to_string()));
+        }
+        db.complete_operation(&operation.id)
+            .map_err(|e| SyncError::Sync(e.to_string()))?;
+    }
     let snapshot = retry_transient(account, || mail_imap::fetch_inbox(account, &password))
         .await
         .map_err(|e| SyncError::Sync(e.to_string()))?;
-    db.apply_snapshot(&account.id, &snapshot)
-        .map_err(|e| SyncError::Sync(e.to_string()))
+    let mailbox = db
+        .apply_snapshot(&account.id, &snapshot)
+        .map_err(|e| SyncError::Sync(e.to_string()))?;
+    db.cache_mailboxes(&account.id, &remote_mailboxes)
+        .map_err(|e| SyncError::Sync(e.to_string()))?;
+    Ok(mailbox)
 }
 
 /// Wait asynchronously for an Inbox update. IDLE disconnects, DNS failures,

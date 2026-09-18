@@ -39,7 +39,7 @@ final class OfflineBridgeTests: XCTestCase {
             XCTAssertEqual(accounts.count, 1)
             XCTAssertEqual(accounts.first?.imapHost, "unreachable.invalid")
             let mailboxes = try firstClient.listMailboxes(accountId: "fixture")
-            let mailbox = try XCTUnwrap(mailboxes.first)
+            let mailbox = try XCTUnwrap(mailboxes.first { $0.remoteName == "INBOX" })
             let firstPage = try firstClient.listMessages(mailboxId: mailbox.id, offset: 0, limit: 100)
             XCTAssertEqual(firstPage.count, 100)
             XCTAssertEqual(firstPage.first?.remoteUid, 105)
@@ -146,5 +146,24 @@ final class OfflineBridgeTests: XCTestCase {
         await store.clearSearch()
         XCTAssertFalse(store.isSearching)
         XCTAssertEqual(store.messages.count, 100)
+    }
+
+    func testQueuedMoveIsImmediatelyVisibleAndUndoableThroughBridge() throws {
+        let path = try XCTUnwrap(ProcessInfo.processInfo.environment["TERN_TEST_DATABASE"])
+        let client = try MailClient(databasePath: path)
+        let mailboxes = try client.listMailboxes(accountId: "fixture")
+        let inbox = try XCTUnwrap(mailboxes.first { $0.remoteName == "INBOX" })
+        let archive = try XCTUnwrap(mailboxes.first { $0.remoteName == "Archive" })
+        let message = try XCTUnwrap(client.listMessages(mailboxId: inbox.id, offset: 0, limit: 100).first)
+
+        let operationID = try client.queueMessageMove(
+            mailboxId: inbox.id,
+            messageId: message.id,
+            destinationMailboxId: archive.id,
+            undoDeadlineMs: Int64.max
+        )
+        XCTAssertEqual(try client.listMessages(mailboxId: inbox.id, offset: 0, limit: 100).count, 99)
+        XCTAssertTrue(try client.undoOperation(operationId: operationID))
+        XCTAssertEqual(try client.listMessages(mailboxId: inbox.id, offset: 0, limit: 100).count, 100)
     }
 }

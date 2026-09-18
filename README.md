@@ -2,7 +2,7 @@
 
 A native Apple mail client with a portable Rust core and an offline-first SQLite store.
 
-**Current scope: first vertical slice, not the public MVP.** The Rust CLI imports the latest 100 Inbox headers; a macOS SwiftUI viewer reads the persisted cache through UniFFI. No IMAP calls or SQL live in Swift. Account setup currently uses the CLI.
+**Current scope: early vertical slices, not the public MVP.** The Rust CLI imports the latest 100 Inbox headers and discovers selectable mailboxes; a macOS SwiftUI viewer reads and updates the persisted cache through UniFFI. No IMAP calls or SQL live in Swift. Account setup currently uses the CLI.
 
 ## Development environment
 
@@ -38,7 +38,7 @@ devbox run -- cargo run --manifest-path core/Cargo.toml --bin tern -- \
   --database "$PWD/tern.sqlite" sync personal
 ```
 
-The sync command prompts for the password without echo; it is not persisted. The import reads headers and flags without marking messages read. Repeated imports update the recent window; this is not yet incremental sync or deletion reconciliation.
+The sync command prompts for the password without echo; it is not persisted. The import reads headers and flags without marking messages read. It also replays expired move operations before refreshing Inbox. Repeated imports update the recent window; this is not yet incremental sync or deletion reconciliation.
 
 ## Browse offline
 
@@ -55,7 +55,7 @@ devbox run -- cargo run --manifest-path core/Cargo.toml --bin tern -- \
 TERN_DATABASE="$PWD/tern.sqlite" devbox run macos
 ```
 
-The first macOS build needs network access to download build dependencies; once built, the application reads the cache entirely offline. Without `TERN_DATABASE`, the app uses its Application Support directory. Select an account and Inbox to browse headers. Empty databases display an empty state, not sample mail.
+The first macOS build needs network access to download build dependencies; once built, the application reads the cache entirely offline. Without `TERN_DATABASE`, the app uses its Application Support directory. Select an account and Inbox to browse headers. Archive, delete, spam, and arbitrary move actions are applied locally and offer Undo for eight seconds; after that window, the next authenticated CLI sync sends them with IMAP `UID MOVE`. Empty databases display an empty state, not sample mail.
 
 ## Layout and next steps
 
@@ -70,7 +70,7 @@ The first macOS build needs network access to download build dependencies; once 
 
 See [architecture and milestones](docs/architecture.md), [push service design and deployment contract](docs/push-service.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
 
-Still ahead: all-folder sync, incremental updates and events, message bodies/HTML, offline mutations, SMTP/compose, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.
+Still ahead: all-folder content sync, incremental updates and events, non-move offline mutations, message bodies/HTML, SMTP/compose and undo-send, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.
 
 ## Agent guidance
 

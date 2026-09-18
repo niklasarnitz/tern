@@ -43,6 +43,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
         },
     )?;
+    for remote_name in ["Archive", "Junk", "Trash"] {
+        db.apply_snapshot(
+            "fixture",
+            &MailboxSnapshot {
+                remote_name: remote_name.into(),
+                uid_validity: 17,
+                uid_next: Some(1),
+                headers: Vec::new(),
+            },
+        )?;
+    }
     println!("Created isolated cache fixture at {path}");
     Ok(())
 }

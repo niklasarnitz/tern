@@ -18,7 +18,7 @@ mod conversations;
 mod mutations;
 mod search;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// Keep one sync snapshot from accidentally turning into an unbounded import.
 pub const MAX_SNAPSHOT_HEADERS: usize = 200;
 pub const MAX_PAGE_SIZE: u32 = 200;
@@ -189,6 +189,27 @@ impl Database {
             .map_err(DatabaseError::from)
     }
 
+    /// Cache selectable remote mailbox names without inventing UID metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account is absent or `SQLite` cannot commit.
+    pub fn cache_mailboxes(&self, account_id: &str, remote_names: &[String]) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        for remote_name in remote_names {
+            let id = mailbox_id(account_id, remote_name);
+            transaction.execute(
+                "INSERT INTO mailboxes
+                    (id, account_id, remote_name, display_name, uid_validity, uid_next)
+                 VALUES (?1, ?2, ?3, ?3, NULL, NULL)
+                 ON CONFLICT(account_id, remote_name) DO NOTHING",
+                params![id, account_id, remote_name],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Apply one bounded mailbox header snapshot in one transaction.
     ///
     /// A snapshot with the same UIDVALIDITY is additive: absent older headers
@@ -294,8 +315,10 @@ impl Database {
              JOIN mailboxes AS mb ON mb.id = mm.mailbox_id
              JOIN messages AS msg ON msg.id = mm.message_id
              WHERE mm.mailbox_id = ?1
-               AND mb.uid_validity IS NOT NULL
-               AND mm.uid_validity = mb.uid_validity
+               AND (mm.local_only = 1 OR (
+                   mb.uid_validity IS NOT NULL
+                   AND mm.uid_validity = mb.uid_validity
+               ))
              ORDER BY mm.remote_uid DESC
              LIMIT ?2 OFFSET ?3",
         )?;
@@ -712,6 +735,18 @@ fn migrate(connection: &Connection) -> Result<()> {
     }
     if version == 3 {
         migrate_search(connection)?;
+        version = 4;
+    }
+    if version == 4 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE pending_operations
+                 ADD COLUMN undo_deadline_ms INTEGER NOT NULL DEFAULT 0;
+             CREATE INDEX pending_operations_due_idx
+                 ON pending_operations(account_id, state, undo_deadline_ms, id);
+             PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -2422,6 +2457,12 @@ mod tests {
             .unwrap();
         assert_eq!(search.len(), 1);
         assert_eq!(search[0].id, "legacy-parent");
+        assert_eq!(
+            db.connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
     }
 
     #[test]
@@ -2541,5 +2582,61 @@ mod tests {
 
         assert!(db.search_messages("Subject", 0, 20).unwrap().is_empty());
         assert_eq!(db.search_messages("Renamed", 0, 20).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queued_move_waits_for_deadline_and_undo_restores_membership() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let inbox = db
+            .apply_snapshot("one", &snapshot("INBOX", 7, &[42]))
+            .unwrap();
+        db.cache_mailboxes("one", &["Archive".into()]).unwrap();
+        let archive = db
+            .list_mailboxes("one")
+            .unwrap()
+            .into_iter()
+            .find(|mailbox| mailbox.remote_name == "Archive")
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+
+        let operation_id = db
+            .queue_move(&inbox.id, &message.id, &archive.id, 5_000)
+            .unwrap();
+        assert!(db.list_messages(&inbox.id, 0, 10).unwrap().is_empty());
+        assert_eq!(db.list_messages(&archive.id, 0, 10).unwrap().len(), 1);
+        assert!(db.claim_due_operations("one", 4_999).unwrap().is_empty());
+        assert!(db.undo_operation(&operation_id).unwrap());
+        assert_eq!(db.list_messages(&inbox.id, 0, 10).unwrap().len(), 1);
+        assert!(db.list_messages(&archive.id, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claimed_move_cannot_be_undone_or_automatically_retried_after_failure() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_account(&account("one")).unwrap();
+        let inbox = db
+            .apply_snapshot("one", &snapshot("INBOX", 7, &[42]))
+            .unwrap();
+        let archive = db
+            .apply_snapshot("one", &snapshot("Archive", 3, &[]))
+            .unwrap();
+        let message = db.list_messages(&inbox.id, 0, 10).unwrap().remove(0);
+        let operation_id = db
+            .queue_move(&inbox.id, &message.id, &archive.id, 5_000)
+            .unwrap();
+
+        let claimed = db.claim_due_operations("one", 5_000).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].remote_uid, 42);
+        assert!(!db.undo_operation(&operation_id).unwrap());
+        db.fail_operation(&operation_id, "sanitized failure")
+            .unwrap();
+        assert!(db.claim_due_operations("one", 5_001).unwrap().is_empty());
+        assert!(!db.undo_operation(&operation_id).unwrap());
+        let failed = db.pending_operations("one").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].retry_count, 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("sanitized failure"));
     }
 }

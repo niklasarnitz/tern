@@ -6,6 +6,13 @@ enum SidebarItem: Hashable {
     case mailbox(String)
 }
 
+struct UndoNotice: Equatable {
+    let operationID: String
+    let messageID: String
+    let sourceMailboxID: String
+    let actionLabel: String
+}
+
 /// Keeps all calls into the Rust application API off the main actor.
 private actor MailCoreActor {
     private let client: MailClient
@@ -33,6 +40,24 @@ private actor MailCoreActor {
     func widgetSnapshot(mailboxIDs: [String], importantLimit: UInt32) throws -> WidgetSnapshot {
         try client.widgetSnapshot(mailboxIds: mailboxIDs, importantLimit: importantLimit)
     }
+
+    func queueMessageMove(
+        mailboxID: String,
+        messageID: String,
+        destinationMailboxID: String,
+        undoDeadlineMilliseconds: Int64
+    ) throws -> String {
+        try client.queueMessageMove(
+            mailboxId: mailboxID,
+            messageId: messageID,
+            destinationMailboxId: destinationMailboxID,
+            undoDeadlineMs: undoDeadlineMilliseconds
+        )
+    }
+
+    func undoOperation(operationID: String) throws -> Bool {
+        try client.undoOperation(operationId: operationID)
+    }
 }
 
 @MainActor
@@ -44,10 +69,12 @@ final class MailStore: ObservableObject {
     @Published private(set) var isLoadingAccounts = false
     @Published private(set) var isLoadingMailboxes = false
     @Published private(set) var isLoadingMessages = false
+    @Published private(set) var isPerformingAction = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var widgetErrorMessage: String?
     @Published private(set) var widgetPrivacy = WidgetDataStore.privacy()
     @Published private(set) var widgetMailboxIDs = WidgetDataStore.selectedMailboxIDs()
+    @Published private(set) var pendingUndo: UndoNotice?
     @Published var selectedAccountID: String?
     @Published var selectedMailboxID: String?
     @Published var selectedMessageID: String?
@@ -58,8 +85,10 @@ final class MailStore: ObservableObject {
     private var core: MailCoreActor?
     private var started = false
     private var requestGeneration: UInt64 = 0
+    private var undoDismissTask: Task<Void, Never>?
 
     let messagePageSize: UInt32 = 100
+    let undoInterval: TimeInterval = 8
     @Published private(set) var messageOffset: UInt32 = 0
     @Published private(set) var hasNextMessagePage = false
 
@@ -77,6 +106,22 @@ final class MailStore: ObservableObject {
 
     var isSearching: Bool {
         activeSearchQuery != nil
+    }
+
+    var moveDestinations: [Mailbox] {
+        mailboxes.filter { $0.id != selectedMailboxID }
+    }
+
+    var archiveMailbox: Mailbox? {
+        mailbox(matching: ["archive", "all mail"])
+    }
+
+    var trashMailbox: Mailbox? {
+        mailbox(matching: ["trash", "deleted", "bin"])
+    }
+
+    var spamMailbox: Mailbox? {
+        mailbox(matching: ["spam", "junk"])
     }
 
     func start() async {
@@ -262,6 +307,61 @@ final class MailStore: ObservableObject {
         widgetMailboxIDs.contains(mailboxID)
     }
 
+    func moveMessage(_ message: MessageSummary, to destination: Mailbox, actionLabel: String) async {
+        guard !isPerformingAction, let core, let mailboxID = selectedMailboxID,
+              message.mailboxId == mailboxID, destination.id != mailboxID else { return }
+        isPerformingAction = true
+        defer { isPerformingAction = false }
+        errorMessage = nil
+
+        let deadline = Date().addingTimeInterval(undoInterval).timeIntervalSince1970 * 1_000
+        do {
+            let operationID = try await core.queueMessageMove(
+                mailboxID: mailboxID,
+                messageID: message.id,
+                destinationMailboxID: destination.id,
+                undoDeadlineMilliseconds: Int64(deadline)
+            )
+            if selectedMessageID == message.id {
+                selectedMessageID = nil
+            }
+            let notice = UndoNotice(
+                operationID: operationID,
+                messageID: message.id,
+                sourceMailboxID: mailboxID,
+                actionLabel: actionLabel
+            )
+            pendingUndo = notice
+            scheduleUndoDismissal(for: notice)
+            if selectedMailboxID == mailboxID {
+                await loadMessages(mailboxID: mailboxID, offset: messageOffset, using: core)
+            }
+            await publishWidgetSnapshot()
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
+    func undoLastAction() async {
+        guard let notice = pendingUndo, let core else { return }
+        undoDismissTask?.cancel()
+        do {
+            guard try await core.undoOperation(operationID: notice.operationID) else {
+                pendingUndo = nil
+                errorMessage = "This action has already been sent to the mail server."
+                return
+            }
+            pendingUndo = nil
+            if selectedMailboxID == notice.sourceMailboxID {
+                await loadMessages(mailboxID: notice.sourceMailboxID, offset: messageOffset, using: core)
+                selectedMessageID = notice.messageID
+            }
+            await publishWidgetSnapshot()
+        } catch {
+            errorMessage = Self.message(for: error)
+        }
+    }
+
     private func loadAccounts() async {
         guard let core else { return }
         let generation = requestGeneration
@@ -308,8 +408,8 @@ final class MailStore: ObservableObject {
                 } else {
                     await loadMessages(mailboxID: selected.id, offset: messageOffset, using: core)
                 }
-            } else if let first = mailboxes.first {
-                await selectMailbox(first, invalidateRequest: false)
+            } else if let initial = initialMailbox() {
+                await selectMailbox(initial, invalidateRequest: false)
             } else {
                 selectedMailboxID = nil
                 selectedSidebarItem = .account(account.id)
@@ -390,6 +490,26 @@ final class MailStore: ObservableObject {
             widgetErrorMessage = nil
         } catch {
             widgetErrorMessage = Self.message(for: error)
+        }
+    }
+
+    private func mailbox(matching names: [String]) -> Mailbox? {
+        mailboxes.first { mailbox in
+            let name = "\(mailbox.displayName) \(mailbox.remoteName)".lowercased()
+            return mailbox.id != selectedMailboxID && names.contains { name.contains($0) }
+        }
+    }
+
+    private func initialMailbox() -> Mailbox? {
+        mailboxes.first(where: { $0.remoteName.uppercased() == "INBOX" }) ?? mailboxes.first
+    }
+
+    private func scheduleUndoDismissal(for notice: UndoNotice) {
+        undoDismissTask?.cancel()
+        undoDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(undoInterval))
+            guard !Task.isCancelled, self?.pendingUndo == notice else { return }
+            self?.pendingUndo = nil
         }
     }
 
