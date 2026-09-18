@@ -356,104 +356,113 @@ fn migrate(connection: &Connection) -> Result<()> {
         return Err(DatabaseError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
+        return create_schema(connection);
+    }
+    if version == 1 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
-             CREATE TABLE accounts (
-                 id TEXT PRIMARY KEY NOT NULL,
-                 email TEXT NOT NULL,
-                 display_name TEXT NOT NULL,
-                 imap_host TEXT NOT NULL,
-                 imap_port INTEGER NOT NULL,
-                 username TEXT NOT NULL,
-                 credential_ref TEXT NOT NULL
-             );
-             CREATE TABLE mailboxes (
-                 id TEXT PRIMARY KEY NOT NULL,
-                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-                 remote_name TEXT NOT NULL,
-                 display_name TEXT NOT NULL,
-                 uid_validity INTEGER,
-                 uid_next INTEGER,
-                 UNIQUE(account_id, remote_name)
-             );
-             CREATE TABLE messages (
-                 id TEXT PRIMARY KEY NOT NULL,
-                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-                 message_id_header TEXT,
-                 subject TEXT NOT NULL,
-                 sender TEXT NOT NULL,
-                 date TEXT NOT NULL,
-                 snippet TEXT NOT NULL DEFAULT '',
-                 sent_at INTEGER,
-                 has_attachments INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE mailbox_messages (
-                 mailbox_id TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
-                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                 uid_validity INTEGER NOT NULL,
-                 remote_uid INTEGER NOT NULL,
-                 is_read INTEGER NOT NULL DEFAULT 0,
-                 is_starred INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY(mailbox_id, uid_validity, remote_uid)
-             );
-             CREATE INDEX mailbox_messages_page_idx
-                 ON mailbox_messages(mailbox_id, uid_validity, remote_uid DESC);
-             CREATE INDEX messages_account_idx ON messages(account_id);
-             CREATE INDEX mailbox_messages_message_id_idx ON mailbox_messages(message_id);
-             CREATE TABLE message_detail_values (
-                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                 category TEXT NOT NULL,
-                 position INTEGER NOT NULL,
-                 value TEXT NOT NULL,
-                 PRIMARY KEY(message_id, category, position)
-             );
-             CREATE TABLE message_attachments (
-                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                 position INTEGER NOT NULL,
-                 id TEXT NOT NULL,
-                 filename TEXT NOT NULL,
-                 mime_type TEXT NOT NULL,
-                 size INTEGER NOT NULL,
-                 PRIMARY KEY(message_id, position)
-             );
-             PRAGMA user_version = 3;
+             CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
+                 ON mailbox_messages(message_id);
+             PRAGMA user_version = 2;
              COMMIT;",
         )?;
-    } else {
-        if version == 1 {
-            connection.execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE INDEX IF NOT EXISTS mailbox_messages_message_id_idx
-                     ON mailbox_messages(message_id);
-                 PRAGMA user_version = 2;
-                 COMMIT;",
-            )?;
-        }
-        if version <= 2 {
-            connection.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE messages ADD COLUMN sent_at INTEGER;
-                 CREATE TABLE message_detail_values (
-                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                     category TEXT NOT NULL,
-                     position INTEGER NOT NULL,
-                     value TEXT NOT NULL,
-                     PRIMARY KEY(message_id, category, position)
-                 );
-                 CREATE TABLE message_attachments (
-                     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                     position INTEGER NOT NULL,
-                     id TEXT NOT NULL,
-                     filename TEXT NOT NULL,
-                     mime_type TEXT NOT NULL,
-                     size INTEGER NOT NULL,
-                     PRIMARY KEY(message_id, position)
-                 );
-                 PRAGMA user_version = 3;
-                 COMMIT;",
-            )?;
-        }
     }
+    if version <= 2 {
+        add_message_details_schema(connection)?;
+    }
+    Ok(())
+}
+
+fn create_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE accounts (
+             id TEXT PRIMARY KEY NOT NULL,
+             email TEXT NOT NULL,
+             display_name TEXT NOT NULL,
+             imap_host TEXT NOT NULL,
+             imap_port INTEGER NOT NULL,
+             username TEXT NOT NULL,
+             credential_ref TEXT NOT NULL
+         );
+         CREATE TABLE mailboxes (
+             id TEXT PRIMARY KEY NOT NULL,
+             account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+             remote_name TEXT NOT NULL,
+             display_name TEXT NOT NULL,
+             uid_validity INTEGER,
+             uid_next INTEGER,
+             UNIQUE(account_id, remote_name)
+         );
+         CREATE TABLE messages (
+             id TEXT PRIMARY KEY NOT NULL,
+             account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+             message_id_header TEXT,
+             subject TEXT NOT NULL,
+             sender TEXT NOT NULL,
+             date TEXT NOT NULL,
+             snippet TEXT NOT NULL DEFAULT '',
+             sent_at INTEGER,
+             has_attachments INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE mailbox_messages (
+             mailbox_id TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+             uid_validity INTEGER NOT NULL,
+             remote_uid INTEGER NOT NULL,
+             is_read INTEGER NOT NULL DEFAULT 0,
+             is_starred INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(mailbox_id, uid_validity, remote_uid)
+         );
+         CREATE INDEX mailbox_messages_page_idx
+             ON mailbox_messages(mailbox_id, uid_validity, remote_uid DESC);
+         CREATE INDEX messages_account_idx ON messages(account_id);
+         CREATE INDEX mailbox_messages_message_id_idx ON mailbox_messages(message_id);
+         CREATE TABLE message_detail_values (
+             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+             category TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             value TEXT NOT NULL,
+             PRIMARY KEY(message_id, category, position)
+         );
+         CREATE TABLE message_attachments (
+             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+             position INTEGER NOT NULL,
+             id TEXT NOT NULL,
+             filename TEXT NOT NULL,
+             mime_type TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             PRIMARY KEY(message_id, position)
+         );
+         PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn add_message_details_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE messages ADD COLUMN sent_at INTEGER;
+         CREATE TABLE message_detail_values (
+             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+             category TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             value TEXT NOT NULL,
+             PRIMARY KEY(message_id, category, position)
+         );
+         CREATE TABLE message_attachments (
+             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+             position INTEGER NOT NULL,
+             id TEXT NOT NULL,
+             filename TEXT NOT NULL,
+             mime_type TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             PRIMARY KEY(message_id, position)
+         );
+         PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
