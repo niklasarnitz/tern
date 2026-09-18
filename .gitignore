@@ -7,3 +7,5 @@ apple/Frameworks/
 *.sqlite*
 *.db
 .env
+
+.worktrees/

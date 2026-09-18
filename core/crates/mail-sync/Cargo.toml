@@ -1,0 +1,10 @@
+[package]
+name = "mail-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+mail-model.workspace = true
+mail-db.workspace = true
+mail-imap.workspace = true
+thiserror.workspace = true
