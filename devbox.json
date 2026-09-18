@@ -1,18 +1,51 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.2/.schema/devbox.schema.json",
-  "packages": [
-    "rustc@1.97.1",
-    "cargo@1.97.1",
-    "rustfmt@1.97.1",
-    "clippy@1.97.1"
-  ],
+  "packages": {
+    "rustc": {
+      "version": "1.97.1"
+    },
+    "cargo": {
+      "version": "1.97.1"
+    },
+    "rustfmt": {
+      "version": "1.97.1"
+    },
+    "clippy": {
+      "version": "1.97.1"
+    },
+    "swiftlint": {
+      "version": "0.65.0",
+      "platforms": [
+        "aarch64-darwin"
+      ]
+    },
+    "swiftformat": {
+      "version": "0.62.1",
+      "platforms": [
+        "aarch64-darwin"
+      ]
+    },
+    "cargo-audit": {
+      "version": "0.22.2"
+    },
+    "cargo-deny": {
+      "version": "0.20.2"
+    }
+  },
   "shell": {
     "scripts": {
       "test": "cargo test --manifest-path core/Cargo.toml --workspace --locked",
       "check": "cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --locked -- -D warnings",
       "fmt": "cargo fmt --manifest-path core/Cargo.toml --all -- --check",
       "bindings": "bash scripts/generate-bindings.sh",
-      "macos": "bash scripts/run-macos.sh"
+      "macos": "bash scripts/run-macos.sh",
+      "audit": "cargo audit --file core/Cargo.lock --deny warnings",
+      "deny": "cargo deny --manifest-path core/Cargo.toml --locked check",
+      "lint-swift": "swiftlint lint --strict --config .swiftlint.yml && swiftformat --lint apple/Sources apple/Package.swift --config .swiftformat",
+      "check-rust": "bash scripts/check-rust.sh",
+      "check-swift": "bash scripts/check-swift.sh",
+      "validate": "bash scripts/validate.sh",
+      "setup-hooks": "git config core.hooksPath .githooks"
     }
   },
   "env": {

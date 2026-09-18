@@ -6,13 +6,12 @@ A native Apple mail client with a portable Rust core and an offline-first SQLite
 
 ## Development environment
 
-Install [Devbox](https://www.jetify.com/docs/devbox/installing_devbox/) and Xcode (for macOS). Rust, Cargo, rustfmt and Clippy are managed by this repository's `devbox.json` / `devbox.lock`. No global rustup installation is needed. Cargo's cache lives in `.devbox/cargo`.
+Install [Devbox](https://www.jetify.com/docs/devbox/installing_devbox/) and Xcode (for macOS). Rust, Cargo, rustfmt and Clippy are managed by this repository's `devbox.json` / `devbox.lock`. No global rustup installation is needed. SwiftLint, SwiftFormat, cargo-audit and cargo-deny are pinned as required quality tools. Cargo's cache lives in `.devbox/cargo`.
 
 ```sh
 devbox install
-devbox run test
-devbox run check
-devbox run fmt
+devbox run setup-hooks
+devbox run validate
 ```
 
 ## Import one Inbox
@@ -55,6 +54,6 @@ The first macOS build needs network access to download build dependencies; once 
 - `mail-core`: application API, UniFFI and development CLI
 - `apple`: native macOS SwiftUI cache viewer
 
-See [architecture and milestones](docs/architecture.md), [dependency decisions](docs/dependencies.md), and [Apple build notes](apple/README.md).
+See [architecture and milestones](docs/architecture.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md).
 
 Still ahead: all-folder sync, incremental updates and events, message bodies/HTML, offline mutations, SMTP/compose, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.

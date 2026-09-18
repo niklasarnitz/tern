@@ -1,0 +1,7 @@
+--swiftversion 6.0
+--indent 4
+--maxwidth 120
+--self remove
+--importgrouping testable-bottom
+--commas always
+--exclude apple/Generated,apple/.build,.worktrees,.devbox

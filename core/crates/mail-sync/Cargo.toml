@@ -8,3 +8,6 @@ mail-model.workspace = true
 mail-db.workspace = true
 mail-imap.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

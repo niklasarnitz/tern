@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# CI validates the committed tree; local hooks validate the working tree.
+devbox run fmt
+devbox run check
+if [[ "$(uname -s)" == Darwin ]]; then
+  devbox run lint-swift
+fi
