@@ -1,6 +1,6 @@
 //! MIME normalization at the boundary between `mail-parser` and the app model.
 
-use ammonia::Builder;
+use ammonia::{Builder, UrlRelative};
 use chrono::{FixedOffset, NaiveDate, TimeZone};
 use mail_model::{Attachment, MessageContent, RemoteHeader};
 use mail_parser::{
@@ -24,25 +24,33 @@ pub enum MimeError {
 #[must_use]
 pub fn parse_header(uid: u32, bytes: &[u8], is_read: bool, is_starred: bool) -> RemoteHeader {
     let parsed = MessageParser::default().parse_headers(bytes);
-    let (message_id, subject, sender, date) = parsed.as_ref().map_or_else(
-        || (None, String::new(), String::new(), String::new()),
-        |message| {
-            (
-                message.message_id().map(ToOwned::to_owned),
-                message.subject().unwrap_or_default().to_owned(),
-                message.from().map(format_sender).unwrap_or_default(),
-                message.date().map(ToString::to_string).unwrap_or_default(),
-            )
-        },
-    );
+    let mut header = parsed
+        .as_ref()
+        .map_or_else(RemoteHeader::default, header_metadata);
+    header.uid = uid;
+    header.is_read = is_read;
+    header.is_starred = is_starred;
+    header
+}
+
+fn header_metadata(message: &mail_parser::Message<'_>) -> RemoteHeader {
+    let ids = |name: HeaderName<'static>| {
+        message
+            .header_as(name, HeaderForm::MessageIds)
+            .into_iter()
+            .flat_map(|value| header_ids(&value))
+            .collect()
+    };
     RemoteHeader {
-        uid,
-        message_id,
-        subject,
-        sender,
-        date,
-        is_read,
-        is_starred,
+        message_id: message.message_id().map(ToOwned::to_owned),
+        subject: message.subject().unwrap_or_default().to_owned(),
+        sender: message.from().map(format_sender).unwrap_or_default(),
+        date: message.date().map(ToString::to_string).unwrap_or_default(),
+        in_reply_to: ids(HeaderName::InReplyTo),
+        references: ids(HeaderName::References),
+        recipients: message.to().map(format_addresses).unwrap_or_default(),
+        cc: message.cc().map(format_addresses).unwrap_or_default(),
+        sent_at: message.date().and_then(date_timestamp),
         ..Default::default()
     }
 }
@@ -58,6 +66,9 @@ pub fn parse_message(
     is_read: bool,
     is_starred: bool,
 ) -> Result<RemoteHeader, MimeError> {
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(MimeError::TooLarge);
+    }
     let message = MessageParser::default()
         .parse(bytes)
         .ok_or(MimeError::Parse)?;
@@ -65,30 +76,12 @@ pub fn parse_message(
         return Err(MimeError::Encoding);
     }
     let content = normalize_content(&message)?;
-    let ids = |name: HeaderName<'static>| -> Vec<String> {
-        message
-            .header_as(name, HeaderForm::MessageIds)
-            .into_iter()
-            .flat_map(|value| header_ids(&value))
-            .collect()
-    };
-    Ok(RemoteHeader {
-        uid,
-        message_id: message.message_id().map(ToOwned::to_owned),
-        subject: message.subject().unwrap_or_default().to_owned(),
-        sender: message.from().map(format_sender).unwrap_or_default(),
-        date: message.date().map(ToString::to_string).unwrap_or_default(),
-        is_read,
-        is_starred,
-        in_reply_to: ids(HeaderName::InReplyTo),
-        references: ids(HeaderName::References),
-        recipients: message.to().map(format_addresses).unwrap_or_default(),
-        cc: message.cc().map(format_addresses).unwrap_or_default(),
-        sent_at: message.date().and_then(date_timestamp),
-        provider_message_id: None,
-        provider_thread_id: None,
-        content: Some(content),
-    })
+    let mut header = header_metadata(&message);
+    header.uid = uid;
+    header.is_read = is_read;
+    header.is_starred = is_starred;
+    header.content = Some(content);
+    Ok(header)
 }
 
 fn header_ids(value: &HeaderValue<'_>) -> Vec<String> {
@@ -164,8 +157,9 @@ fn normalize_content(message: &mail_parser::Message<'_>) -> Result<MessageConten
     for (index, part) in message.attachments().enumerate() {
         let data = match &part.body {
             PartType::Binary(data) | PartType::InlineBinary(data) => data.as_ref().to_vec(),
+            PartType::Text(text) | PartType::Html(text) => text.as_bytes().to_vec(),
             PartType::Message(nested) => nested.raw_message().to_vec(),
-            _ => return Err(MimeError::Encoding),
+            PartType::Multipart(_) => return Err(MimeError::Encoding),
         };
         total = total.checked_add(data.len()).ok_or(MimeError::TooLarge)?;
         if total > MAX_MESSAGE_BYTES {
@@ -234,7 +228,15 @@ fn sanitize_html(html: &str) -> String {
             "tr",
             "ul",
         ]))
-        .url_schemes(HashSet::from(["cid"]))
+        .url_schemes(HashSet::from(["http", "https", "mailto", "cid"]))
+        .url_relative(UrlRelative::Deny)
+        .attribute_filter(|element, attribute, value| {
+            if element == "img" && attribute == "src" && !value.starts_with("cid:") {
+                None
+            } else {
+                Some(value.into())
+            }
+        })
         .clean(html)
         .to_string()
 }
@@ -242,24 +244,44 @@ fn sanitize_html(html: &str) -> String {
 #[must_use]
 pub fn conversation_plain_text(text: &str, previous: &[String]) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut best = None;
-    for old in previous {
-        let old_lines: Vec<&str> = old.lines().filter(|line| !line.trim().is_empty()).collect();
-        if old_lines.is_empty() {
+    let mut removed = false;
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].trim_start().starts_with('>') {
+            output.push(lines[index]);
+            index += 1;
             continue;
         }
-        for start in 0..lines.len() {
-            if start + old_lines.len() <= lines.len()
-                && lines[start..start + old_lines.len()]
+        let start = index;
+        while index < lines.len() && lines[index].trim_start().starts_with('>') {
+            index += 1;
+        }
+        let quoted: Vec<String> = lines[start..index]
+            .iter()
+            .map(|line| {
+                line.trim_start()
+                    .trim_start_matches('>')
+                    .trim_start()
+                    .to_owned()
+            })
+            .collect();
+        let matches_previous = previous.iter().any(|old| {
+            let old_lines: Vec<&str> = old.lines().collect();
+            !old_lines.is_empty()
+                && old_lines.len() == quoted.len()
+                && old_lines
                     .iter()
-                    .zip(&old_lines)
-                    .all(|(a, b)| a.trim_start_matches('>').trim() == *b)
-            {
-                best = Some(lines[..start].join("\n").trim_end().to_owned());
-            }
+                    .zip(&quoted)
+                    .all(|(old, line)| *old == line)
+        });
+        if matches_previous {
+            removed = true;
+        } else {
+            output.extend(&lines[start..index]);
         }
     }
-    best
+    removed.then(|| output.join("\n").trim_end().to_owned())
 }
 
 #[cfg(test)]
