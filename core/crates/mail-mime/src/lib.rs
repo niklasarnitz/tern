@@ -2,11 +2,11 @@
 
 use ammonia::{Builder, UrlRelative};
 use chrono::{FixedOffset, NaiveDate, TimeZone};
-use mail_model::{Attachment, MessageContent, RemoteHeader};
+use mail_model::{Attachment, DeliveryRecipient, DeliveryReport, MessageContent, RemoteHeader};
 use mail_parser::{
     Addr, HeaderForm, HeaderName, HeaderValue, MessageParser, MimeHeaders, PartType,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 pub const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
@@ -158,11 +158,16 @@ fn date_timestamp(date: &mail_parser::DateTime) -> Option<i64> {
 }
 
 fn normalize_content(message: &mail_parser::Message<'_>) -> Result<MessageContent, MimeError> {
-    let plain_text = (0..message.text_body_count())
+    let human_text = (0..message.text_body_count())
         .filter_map(|i| message.body_text(i))
         .map(std::borrow::Cow::into_owned)
         .collect::<Vec<_>>()
         .join("\n\n");
+    let delivery_report = parse_delivery_report(message);
+    let plain_text = delivery_report.as_ref().map_or_else(
+        || human_text.clone(),
+        |report| format_delivery_report(report, &human_text),
+    );
     let html = sanitize_html(
         &(0..message.html_body_count())
             .filter_map(|i| message.body_html(i))
@@ -178,7 +183,11 @@ fn normalize_content(message: &mail_parser::Message<'_>) -> Result<MessageConten
         return Err(MimeError::TooLarge);
     }
     let mut attachments = Vec::new();
-    for (index, part) in message.attachments().enumerate() {
+    for part in message.attachments() {
+        if is_delivery_status(part) {
+            continue;
+        }
+        let index = attachments.len();
         let data = match &part.body {
             PartType::Binary(data) | PartType::InlineBinary(data) => data.as_ref().to_vec(),
             PartType::Text(text) | PartType::Html(text) => text.as_bytes().to_vec(),
@@ -210,8 +219,204 @@ fn normalize_content(message: &mail_parser::Message<'_>) -> Result<MessageConten
         plain_text,
         html,
         attachments,
+        delivery_report,
     })
 }
+
+fn is_delivery_status(part: &mail_parser::MessagePart<'_>) -> bool {
+    part.content_type().is_some_and(|content_type| {
+        content_type.ctype().eq_ignore_ascii_case("message")
+            && content_type.subtype().is_some_and(|subtype| {
+                subtype.eq_ignore_ascii_case("delivery-status")
+                    || subtype.eq_ignore_ascii_case("global-delivery-status")
+            })
+    })
+}
+
+fn parse_delivery_report(message: &mail_parser::Message<'_>) -> Option<DeliveryReport> {
+    let mut report = DeliveryReport::default();
+    for part in &message.parts {
+        if !is_delivery_status(part) {
+            continue;
+        }
+        let blocks = parse_status_blocks(part.contents());
+        for (index, fields) in blocks.into_iter().enumerate() {
+            if index == 0 && report.reporting_mta.is_empty() {
+                report.reporting_mta = field_value(&fields, "reporting-mta")
+                    .map(|value| strip_typed_value(&value))
+                    .unwrap_or_default();
+            }
+            if index > 0 || fields.contains_key("final-recipient") {
+                let recipient = field_value(&fields, "final-recipient")
+                    .or_else(|| field_value(&fields, "original-recipient"))
+                    .map(|value| strip_typed_value(&value))
+                    .unwrap_or_default();
+                let action = field_value(&fields, "action").unwrap_or_default();
+                let diagnostic = field_value(&fields, "diagnostic-code")
+                    .map(|value| strip_typed_value(&value))
+                    .unwrap_or_default();
+                let status_code = field_value(&fields, "status")
+                    .or_else(|| find_enhanced_status(&diagnostic))
+                    .unwrap_or_default();
+                if recipient.is_empty()
+                    && action.is_empty()
+                    && status_code.is_empty()
+                    && diagnostic.is_empty()
+                {
+                    continue;
+                }
+                report.recipients.push(DeliveryRecipient {
+                    recipient,
+                    action,
+                    status_description: describe_status(&status_code).to_owned(),
+                    status_code,
+                    diagnostic,
+                });
+            }
+        }
+    }
+    (!report.recipients.is_empty()).then_some(report)
+}
+
+fn parse_status_blocks(bytes: &[u8]) -> Vec<HashMap<String, String>> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut blocks = Vec::new();
+    let mut fields = HashMap::<String, String>::new();
+    let mut last_name = None::<String>;
+    for raw_line in text.lines().chain(std::iter::once("")) {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            if !fields.is_empty() {
+                blocks.push(std::mem::take(&mut fields));
+            }
+            last_name = None;
+        } else if line.starts_with([' ', '\t']) {
+            if let Some(name) = &last_name {
+                if let Some(value) = fields.get_mut(name) {
+                    value.push(' ');
+                    value.push_str(line.trim());
+                }
+            }
+        } else if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            fields.insert(name.clone(), value.trim().to_owned());
+            last_name = Some(name);
+        } else {
+            last_name = None;
+        }
+    }
+    blocks
+}
+
+fn field_value(fields: &HashMap<String, String>, name: &str) -> Option<String> {
+    fields
+        .get(name)
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty())
+}
+
+fn strip_typed_value(value: &str) -> String {
+    value
+        .split_once(';')
+        .map_or(value, |(_, untyped)| untyped)
+        .trim()
+        .to_owned()
+}
+
+fn find_enhanced_status(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
+        })
+        .find(|word| {
+            let components = word.split('.').collect::<Vec<_>>();
+            components.len() == 3
+                && components[0].len() == 1
+                && matches!(components[0], "2" | "4" | "5")
+                && components[1..].iter().all(|component| {
+                    !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn describe_status(code: &str) -> &'static str {
+    match code {
+        "5.1.1" => "The recipient address does not exist",
+        "5.1.2" => "The recipient domain could not be reached",
+        "5.2.2" => "The recipient mailbox is full",
+        "5.7.1" => "Delivery was rejected by a security or policy rule",
+        code if code.starts_with("2.") => "Delivery succeeded",
+        code if code.starts_with("4.") => "Delivery is temporarily delayed",
+        code if code.starts_with("5.") => "Delivery failed permanently",
+        _ => "",
+    }
+}
+
+fn format_delivery_report(report: &DeliveryReport, human_text: &str) -> String {
+    let headline = if report
+        .recipients
+        .iter()
+        .all(|recipient| recipient.action.eq_ignore_ascii_case("failed"))
+    {
+        "Delivery failed"
+    } else if report
+        .recipients
+        .iter()
+        .all(|recipient| recipient.action.eq_ignore_ascii_case("delayed"))
+    {
+        "Delivery delayed"
+    } else if report.recipients.iter().all(|recipient| {
+        matches!(
+            recipient.action.to_ascii_lowercase().as_str(),
+            "delivered" | "relayed" | "expanded"
+        )
+    }) {
+        "Delivery succeeded"
+    } else {
+        "Delivery status"
+    };
+    let mut lines = vec![headline.to_owned()];
+    for recipient in &report.recipients {
+        lines.push(String::new());
+        if !recipient.recipient.is_empty() {
+            lines.push(format!("Recipient: {}", recipient.recipient));
+        }
+        let status = match (
+            recipient.status_code.is_empty(),
+            recipient.status_description.is_empty(),
+        ) {
+            (false, false) => format!(
+                "Status: {} — {}",
+                recipient.status_code, recipient.status_description
+            ),
+            (false, true) => format!("Status: {}", recipient.status_code),
+            (true, false) => format!("Status: {}", recipient.status_description),
+            (true, true) if !recipient.action.is_empty() => {
+                format!("Status: {}", recipient.action)
+            }
+            (true, true) => String::new(),
+        };
+        if !status.is_empty() {
+            lines.push(status);
+        }
+        if !recipient.diagnostic.is_empty() {
+            lines.push(format!("Details: {}", recipient.diagnostic));
+        }
+    }
+    if !report.reporting_mta.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Reported by: {}", report.reporting_mta));
+    }
+    let human_text = human_text.trim();
+    if !human_text.is_empty() {
+        lines.push(String::new());
+        lines.push(human_text.to_owned());
+    }
+    lines.join("\n")
+}
+
 fn sanitize_filename(value: &str) -> String {
     value
         .chars()
@@ -227,7 +432,7 @@ fn sanitize_filename(value: &str) -> String {
         .to_owned()
 }
 fn sanitize_html(html: &str) -> String {
-    Builder::default()
+    Builder::empty()
         .tags(HashSet::from([
             "a",
             "b",
@@ -258,17 +463,32 @@ fn sanitize_html(html: &str) -> String {
             "tr",
             "ul",
         ]))
+        .clean_content_tags(HashSet::from([
+            "applet", "audio", "canvas", "embed", "iframe", "math", "noembed", "noscript",
+            "object", "script", "style", "svg", "template", "video",
+        ]))
+        .tag_attributes(HashMap::from([
+            ("a", HashSet::from(["href"])),
+            ("img", HashSet::from(["alt", "src"])),
+        ]))
+        .generic_attributes(HashSet::new())
         .url_schemes(HashSet::from(["http", "https", "mailto", "cid"]))
         .url_relative(UrlRelative::Deny)
-        .attribute_filter(|element, attribute, value| {
-            if element == "img" && attribute == "src" && !value.starts_with("cid:") {
-                None
-            } else {
-                Some(value.into())
-            }
+        .attribute_filter(|element, attribute, value| match (element, attribute) {
+            ("img", "src") if !has_cid_scheme(value) => None,
+            ("a", "href") if has_cid_scheme(value) => None,
+            _ => Some(value.into()),
         })
+        .link_rel(Some("noopener noreferrer"))
+        .strip_comments(true)
         .clean(html)
         .to_string()
+}
+
+fn has_cid_scheme(value: &str) -> bool {
+    value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cid:"))
 }
 
 #[must_use]
@@ -431,6 +651,92 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_multi_recipient_delivery_status_report() {
+        let raw = concat!(
+            "From: Mail Delivery System <mailer-daemon@example.test>\r\n",
+            "Subject: Delivery Status Notification\r\n",
+            "Content-Type: multipart/report; report-type=delivery-status; boundary=dsn\r\n\r\n",
+            "--dsn\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
+            "The server could not deliver all recipients.\r\n",
+            "--dsn\r\nContent-Type: message/delivery-status\r\n\r\n",
+            "Reporting-MTA: dns; mx.example.test\r\n",
+            "Arrival-Date: Fri, 18 Sep 2026 08:00:00 +0000\r\n\r\n",
+            "Final-Recipient: rfc822; missing@example.test\r\n",
+            "Action: failed\r\n",
+            "Status: 5.1.1\r\n",
+            "Diagnostic-Code: smtp; 550 5.1.1 User unknown\r\n\r\n",
+            "Original-Recipient: rfc822; slow@example.test\r\n",
+            "Action: delayed\r\n",
+            "Diagnostic-Code: smtp; 450 4.2.2 Mailbox temporarily\r\n",
+            " full\r\n\r\n",
+            "--dsn\r\nContent-Type: message/rfc822\r\n",
+            "Content-Disposition: attachment; filename=original.eml\r\n\r\n",
+            "From: sender@example.test\r\nTo: missing@example.test\r\n",
+            "Subject: Hello\r\nContent-Type: text/plain\r\n\r\nHello\r\n",
+            "--dsn--\r\n"
+        );
+        let parsed = parse_message(10, raw.as_bytes(), false, false);
+        assert!(parsed.is_ok());
+        if let Ok(header) = parsed {
+            assert!(header.content.is_some());
+            if let Some(content) = header.content {
+                assert_eq!(content.attachments.len(), 1);
+                assert_eq!(content.attachments[0].filename, "original.eml");
+                assert!(content.plain_text.starts_with("Delivery status\n"));
+                assert!(content
+                    .plain_text
+                    .contains("Recipient: missing@example.test"));
+                assert!(content
+                    .plain_text
+                    .contains("Status: 5.1.1 — The recipient address does not exist"));
+                assert!(content.plain_text.contains("Recipient: slow@example.test"));
+                assert!(content
+                    .plain_text
+                    .contains("Status: 4.2.2 — Delivery is temporarily delayed"));
+                assert!(content
+                    .plain_text
+                    .contains("Details: 450 4.2.2 Mailbox temporarily full"));
+                assert!(content.plain_text.contains("Reported by: mx.example.test"));
+                assert!(content
+                    .plain_text
+                    .ends_with("The server could not deliver all recipients."));
+
+                assert!(content.delivery_report.is_some());
+                if let Some(report) = content.delivery_report {
+                    assert_eq!(report.reporting_mta, "mx.example.test");
+                    assert_eq!(report.recipients.len(), 2);
+                    assert_eq!(report.recipients[0].action, "failed");
+                    assert_eq!(report.recipients[1].status_code, "4.2.2");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recognizes_international_delivery_status_report() {
+        let raw = concat!(
+            "Content-Type: multipart/report; report-type=global-delivery-status; boundary=x\r\n\r\n",
+            "--x\r\nContent-Type: text/plain\r\n\r\nDelivery complete.\r\n",
+            "--x\r\nContent-Type: message/global-delivery-status\r\n\r\n",
+            "Reporting-MTA: dns; mx.example.test\r\n\r\n",
+            "Final-Recipient: utf-8; user@example.test\r\n",
+            "Action: delivered\r\nStatus: 2.0.0\r\n\r\n",
+            "--x--\r\n"
+        );
+        let parsed = parse_message(11, raw.as_bytes(), false, false);
+        assert!(parsed.is_ok());
+        if let Ok(header) = parsed {
+            if let Some(content) = header.content {
+                assert!(content.plain_text.starts_with("Delivery succeeded\n"));
+                assert!(content
+                    .plain_text
+                    .contains("Status: 2.0.0 — Delivery succeeded"));
+                assert!(content.attachments.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn normalized_body_budget_is_enforced_without_attachments() {
         let repeated = "<b>x</b>".repeat(3_000_000);
         let raw = format!("Content-Type: text/html\r\n\r\n{repeated}");
@@ -473,11 +779,82 @@ mod tests {
         );
     }
     #[test]
-    fn sanitizes_active_and_remote_html() {
-        let clean = sanitize_html(
-            "<script>alert(1)</script><img src=\"https://x.test/a\"><img src=\"cid:abc\">",
+    fn sanitizes_active_embedded_and_form_html() {
+        let clean = sanitize_html(concat!(
+            "<script>alert(1)</script><style>body{display:none}</style>",
+            "<form action=\"https://evil.test\"><p>visible</p>",
+            "<input name=secret><button formaction=\"https://evil.test\">Send</button></form>",
+            "<iframe srcdoc=\"<script>alert(2)</script>\">frame</iframe>",
+            "<object data=\"https://evil.test\">object</object>",
+            "<embed src=\"https://evil.test\"><svg onload=\"alert(3)\"><circle/></svg>",
+            "<p onclick=\"alert(4)\">safe</p>",
+        ));
+        assert!(
+            clean.contains("<p>visible</p>") && clean.contains("Send") && clean.contains("safe")
         );
-        assert!(!clean.contains("script") && !clean.contains("https://"));
-        assert!(clean.contains("cid:abc"));
+        for forbidden in [
+            "script",
+            "style",
+            "form",
+            "input",
+            "button",
+            "iframe",
+            "object",
+            "embed",
+            "svg",
+            "onclick",
+            "formaction",
+            "https://evil.test",
+            "alert(",
+        ] {
+            assert!(!clean.contains(forbidden), "retained {forbidden}: {clean}");
+        }
+    }
+
+    #[test]
+    fn blocks_tracking_and_local_resource_urls() {
+        let clean = sanitize_html(concat!(
+            "<img src=\"https://tracker.test/pixel\" alt=remote>",
+            "<img src=\"//tracker.test/pixel\" alt=relative>",
+            "<img src=\"file:///etc/passwd\" alt=file>",
+            "<img src=\"cid:part-1\" alt=inline width=1 height=1>",
+            "<a href=\"file:///etc/passwd\">file link</a>",
+            "<a href=\"cid:part-1\">cid link</a>",
+            "<a href=\"https://example.test/path\">web link</a>",
+        ));
+        assert!(!clean.contains("tracker.test") && !clean.contains("file:///"));
+        assert!(clean.contains("<img src=\"cid:part-1\" alt=\"inline\">"));
+        assert!(
+            !clean.contains("width=")
+                && !clean.contains("height=")
+                && !clean.contains("href=\"cid:")
+        );
+        assert!(clean.contains("href=\"https://example.test/path\" rel=\"noopener noreferrer\""));
+    }
+
+    #[test]
+    fn blocks_dangerous_urls_and_css_abuse() {
+        let clean = sanitize_html(concat!(
+            "<style>@import url(https://tracker.test);</style>",
+            "<div id=overlay class=cover style=\"position:fixed;background:url(https://tracker.test)\">",
+            "<a href=\"java&#x73;cript:alert(1)\">script</a>",
+            "<a href=\"data:text/html,evil\">data</a>",
+            "<a href=\"mailto:user@example.test\">mail</a></div>",
+        ));
+        for forbidden in [
+            "style=",
+            "<style",
+            "@import",
+            "class=",
+            "id=",
+            "position",
+            "tracker.test",
+            "javascript:",
+            "data:text/html",
+            "alert(",
+        ] {
+            assert!(!clean.contains(forbidden), "retained {forbidden}: {clean}");
+        }
+        assert!(clean.contains("href=\"mailto:user@example.test\""));
     }
 }

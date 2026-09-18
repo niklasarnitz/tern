@@ -2,9 +2,9 @@
 
 ## Scope
 
-`mail-imap` owns the first slice's read-only IMAP boundary: verified implicit
-TLS, authenticated Inbox header snapshots, and selectable remote mailbox names.
-It converts protocol data into `mail-model` snapshots through `mail-mime`.
+`mail-imap` owns the verified implicit-TLS IMAP boundary: authenticated mailbox
+snapshots, bounded header/body fetches, and remote mailbox operations. It
+converts protocol data into `mail-model` records through `mail-mime`.
 Inherit shared repository guidance from [`../../../AGENTS.md`](../../../AGENTS.md);
 dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependencies.md).
 
@@ -13,9 +13,11 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 - Use the platform certificate roots and implicit TLS. The current slice has no
   STARTTLS downgrade path, certificate override, or Gmail password login;
   Gmail requires the future OAuth path.
-- `EXAMINE` and `BODY.PEEK` keep header sync read-only. Keep the bounded recent
-  fetch, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and timeout
-  behavior intact.
+- `EXAMINE` and `BODY.PEEK` keep reads read-only. `UIDSTORE` and `MOVE` execute
+  remote mutations only through the sync operation path. Keep bounded recent header and
+  body fetches, UIDVALIDITY/UIDNEXT metadata, deterministic UID ordering, and
+  timeout behavior intact. Body fetches must honor the MIME byte budget before
+  handing data to normalization.
 - `async-imap` convenience streaming helpers can discard tagged failure status.
   Retain the `run_command`/`read_response` typed adapter: drain until the
   matching request tag, inspect its status, and reject tagged `NO`/non-OK.
@@ -25,9 +27,12 @@ dependency notes are in [`../../../docs/dependencies.md`](../../../docs/dependen
 ## Coordination
 
 Protocol or snapshot changes require coordination with `mail-mime`,
-`mail-model`, `mail-sync`, and `mail-db` identity rules. STARTTLS, OAuth,
-incremental sync, IDLE, mutations, bodies, and attachments are future slices;
-do not introduce placeholder SMTP/events/OAuth implementations here.
+`mail-model`, `mail-sync`, and `mail-db` identity rules. IDLE is limited to a
+bounded change notification with polling fallback; reconnect policy belongs to
+`mail-sync`. STARTTLS, OAuth, incremental reconciliation, and SMTP remain future
+slices. Message bodies and attachments flow through the bounded MIME
+normalization path; mutations remain owned by store/sync orchestration. Do not
+introduce placeholder implementations here.
 
 ## Validation
 

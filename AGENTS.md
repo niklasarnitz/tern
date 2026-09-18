@@ -10,6 +10,7 @@ The implemented slice is a CLI import of recent Inbox headers into SQLite plus a
 
 ```text
 Apple SwiftUI -> UniFFI -> mail-core -> mail-db -> SQLite
+                         -> mail-autoconfig -> HTTPS / DNS / TLS probe
 Development CLI -> mail-sync -> mail-imap -> mail-mime
                             -> mail-db
 mail-model supplies shared records across these boundaries.
@@ -18,6 +19,7 @@ mail-model supplies shared records across these boundaries.
 | Area | Ownership |
 | --- | --- |
 | `core/crates/mail-model` | Portable records and exported value types |
+| `core/crates/mail-autoconfig` | Provider presets, domain autoconfig, DNS SRV, safe fallbacks and unauthenticated connection diagnostics |
 | `core/crates/mail-db` | Schema migrations, persistence, identities and indexed pages |
 | `core/crates/mail-imap` | Verified TLS, IMAP commands and typed protocol responses |
 | `core/crates/mail-mime` | Normalization through an existing MIME parser |
@@ -30,7 +32,11 @@ Keep these boundaries explicit. Expose application operations across FFI, rather
 
 Read [architecture and milestones](docs/architecture.md) before changing ownership, persistence semantics or feature scope. Read [dependency decisions](docs/dependencies.md) before changing a protocol, MIME, TLS, database or bridge library. Read [validation evidence](docs/validation.md) when assessing readiness; dated test results are historical evidence, not proof that the current tree passes.
 
-## Subagents and branches
+## Branches and pull requests
+
+Always create a new, descriptively named branch before making changes. Never commit directly to `master`. When the requested work is complete and verified, push the branch and open a GitHub pull request (merge request) targeting `master`; do not merge it unless the user explicitly asks. If unrelated user or agent changes are already present, preserve them and ensure the pull request contains only the work owned by the current task.
+
+## Subagents
 
 Use cheaper capable subagents for bounded, independent work that can run alongside useful lead-agent work. Keep small or tightly coupled changes local; do not create coordination overhead just to delegate. Prefer the available lower-cost model for routine implementation and documentation; increase capability only when the task warrants it.
 
@@ -38,8 +44,8 @@ Use cheaper capable subagents for bounded, independent work that can run alongsi
 2. Give each subagent a separate branch and worktree based on `master` (or an explicitly agreed dependency branch). Use descriptive names, such as `feature/mailbox-sync` or `docs/crate-guidance`. Create worktrees under ignored `.worktrees/`; never switch the branch in another agent's checkout.
 3. Assign a small slice with an objective, owned files, dependencies, interface contract, exact checks, a checkable done condition and expected handoff evidence. One agent owns each file at a time. The lead owns shared manifests, lockfiles and generated-binding integration unless explicitly delegated.
 4. Subagents make focused commits on their own branches and hand back the branch, commit IDs, changed behavior, checks/results and remaining limitations. They do not merge themselves into `master`.
-5. The lead reads the complete branch diff against its agreed base, checks architecture/spec fit and verification evidence, and requests fixes before merging. Passing tests alone do not replace review.
-6. Merge approved branches into `master` with a named merge commit (`git merge --no-ff <branch>`). Validate the integrated code and resolve cross-slice problems before declaring completion. Retain branches/worktrees until their work is safely committed and merged; inventory uncommitted files before cleanup.
+5. The lead reads the complete branch diff against its agreed base, checks architecture/spec fit and verification evidence, and requests fixes before integration. Passing tests alone do not replace review.
+6. Integrate approved subagent branches into the lead's task branch with named merge commits (`git merge --no-ff <branch>`). Validate the integrated code and resolve cross-slice problems before opening the pull request. Retain branches/worktrees until their work is safely committed and integrated; inventory uncommitted files before cleanup.
 
 Do not create user-facing tasks for internal delegation unless the user explicitly asks for a separate task.
 

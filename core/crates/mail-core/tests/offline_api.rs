@@ -73,6 +73,15 @@ fn ffi_api_reopens_a_persisted_snapshot_without_network() {
     assert_eq!(details.reply_to, vec!["Replies <reply@example.invalid>"]);
     let final_page = client.list_messages(mailbox_id, 90, 30).unwrap();
     assert_eq!(final_page.len(), 10);
+    let search_page = client
+        .search_messages(
+            "subject:\"Message 41\" from:Sender is:unread account:test-account".into(),
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(search_page.len(), 1);
+    assert_eq!(search_page[0].remote_uid, 41);
     drop(client);
     std::fs::remove_file(path).unwrap();
 }

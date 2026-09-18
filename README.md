@@ -16,7 +16,19 @@ devbox run validate
 
 ## Import one Inbox
 
-Copy `docs/account.example.json` and replace the example configuration. Do not add passwords to that file. The initial transport is verified implicit TLS, normally port 993. iCloud requires its app-specific password. Gmail is intentionally rejected until OAuth is implemented.
+Discover settings from an address first. The report includes the selected candidate, alternatives, authentication type, discovery source, and sanitized TLS/IMAP connection diagnostics. Known Gmail, iCloud, Outlook, Yahoo, AOL, and Fastmail domains use presets; other domains use HTTPS autoconfig, RFC 6186 DNS SRV records, then `imap.<domain>` / `mail.<domain>` fallbacks. Discovery never authenticates.
+
+```sh
+devbox run -- cargo run --manifest-path core/Cargo.toml --bin tern -- \
+  discover-account you@example.com
+
+# Any discovered value can be overridden and rechecked:
+devbox run -- cargo run --manifest-path core/Cargo.toml --bin tern -- \
+  discover-account you@example.com \
+  --imap-host mail.example.com --imap-port 993 --username login-name
+```
+
+Copy `docs/account.example.json` and apply the recommended configuration, or provide manual values when no candidate succeeds. Do not add passwords to that file. The initial transport is verified implicit TLS, normally port 993. iCloud requires its app-specific password. Discovery reports Gmail and Outlook OAuth requirements, but Gmail synchronization remains intentionally rejected until OAuth is implemented.
 
 ```sh
 devbox run -- cargo run --manifest-path core/Cargo.toml --bin tern -- \
@@ -49,12 +61,14 @@ The first macOS build needs network access to download build dependencies; once 
 
 - `core/crates/mail-model`: portable records
 - `mail-db`: SQLite migration, identities, transactions and capped pages
+- `mail-autoconfig`: provider, HTTPS autoconfig, DNS SRV, fallback and connection diagnostics
 - `mail-imap`, `mail-mime`: secure IMAP header fetch and MIME normalization
 - `mail-sync`: credential abstraction and import orchestration
 - `mail-core`: application API, UniFFI and development CLI
+- `mail-push-service`: optional content-free APNs wake relay
 - `apple`: native macOS SwiftUI cache viewer
 
-See [architecture and milestones](docs/architecture.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
+See [architecture and milestones](docs/architecture.md), [push service design and deployment contract](docs/push-service.md), [dependency decisions](docs/dependencies.md), [Apple build notes](apple/README.md), and [required quality gates](docs/quality.md). See [local validation and remaining gates](docs/validation.md) for tested scope.
 
 Still ahead: all-folder sync, incremental updates and events, message bodies/HTML, offline mutations, SMTP/compose, Apple Keychain onboarding, Gmail OAuth, an installable iOS target, and provider/device/performance validation. The Swift package is a development macOS executable, not a signed app distribution. Credentials for live mail accounts are not included.
 

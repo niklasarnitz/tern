@@ -21,6 +21,75 @@ struct TernApp: App {
                 .disabled(!store.canRefresh)
             }
         }
+        Settings {
+            WidgetSettingsView(store: store)
+        }
+    }
+}
+
+private struct WidgetSettingsView: View {
+    @ObservedObject var store: MailStore
+
+    var body: some View {
+        Form {
+            Section("Privacy") {
+                Picker("Show on widgets", selection: privacyBinding) {
+                    ForEach(WidgetPrivacy.allCases) { privacy in
+                        Text(privacy.title).tag(privacy)
+                    }
+                }
+                Text(
+                    "Counts only is the default. More private mail content is copied to the widget cache " +
+                        "only when you allow it."
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Selected Mailboxes") {
+                if store.mailboxes.isEmpty {
+                    Text("Open an account to choose mailboxes.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.mailboxes, id: \.id) { mailbox in
+                        Toggle(
+                            mailbox.displayName.isEmpty ? mailbox.remoteName : mailbox.displayName,
+                            isOn: mailboxBinding(mailbox.id)
+                        )
+                    }
+                }
+                Text("Widgets read only the mailboxes selected here. No mailbox is shared by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let error = store.widgetErrorMessage {
+                Section {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480, height: 420)
+    }
+
+    private var privacyBinding: Binding<WidgetPrivacy> {
+        Binding(
+            get: { store.widgetPrivacy },
+            set: { privacy in
+                Task { await store.setWidgetPrivacy(privacy) }
+            }
+        )
+    }
+
+    private func mailboxBinding(_ mailboxID: String) -> Binding<Bool> {
+        Binding(
+            get: { store.isMailboxIncludedInWidgets(mailboxID) },
+            set: { included in
+                Task { await store.setMailbox(mailboxID, includedInWidgets: included) }
+            }
+        )
     }
 }
 
@@ -129,10 +198,14 @@ private struct MessageListView: View {
         Group {
             if store.isLoadingMessages, store.messages.isEmpty {
                 ProgressView("Loading messages…")
-            } else if store.mailboxes.isEmpty {
+            } else if store.mailboxes.isEmpty, !store.isSearching {
                 ContentUnavailableView("Select an Account", systemImage: "sidebar.left")
             } else if store.messages.isEmpty, !store.isLoadingMessages {
-                ContentUnavailableView("No Messages", systemImage: "tray")
+                if store.isSearching {
+                    ContentUnavailableView.search(text: store.activeSearchQuery ?? "")
+                } else {
+                    ContentUnavailableView("No Messages", systemImage: "tray")
+                }
             } else {
                 List(store.messages, id: \.id, selection: $store.selectedMessageID) { message in
                     MessageRow(message: message)
@@ -141,7 +214,22 @@ private struct MessageListView: View {
                 .listStyle(.inset)
             }
         }
-        .navigationTitle(store.selectedMailbox?.displayName ?? "Mail")
+        .navigationTitle(
+            store.isSearching ? "Search Results" : store.selectedMailbox?.displayName ?? "Mail"
+        )
+        .searchable(
+            text: $store.searchText,
+            placement: .toolbar,
+            prompt: "Search or use from:, before:, is:unread…"
+        )
+        .onSubmit(of: .search) {
+            Task { await store.submitSearch() }
+        }
+        .onChange(of: store.searchText) { _, query in
+            if query.isEmpty, store.isSearching {
+                Task { await store.clearSearch() }
+            }
+        }
         .toolbar {
             ToolbarItem {
                 Button {
@@ -184,12 +272,17 @@ private struct MessageListView: View {
     private var pageLabel: String {
         let first = store.messageOffset + 1
         let last = store.messageOffset + UInt32(store.messages.count)
-        return "Messages \(first)–\(last)"
+        let noun = store.isSearching ? "Results" : "Messages"
+        return "\(noun) \(first)–\(last)"
     }
 }
 
 private struct MessageRow: View {
     let message: MessageSummary
+
+    private var sender: SenderIdentity {
+        SenderIdentity(message.sender)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -200,7 +293,7 @@ private struct MessageRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text(message.sender.isEmpty ? "Unknown sender" : message.sender)
+                    Text(sender.displayName)
                         .fontWeight(message.isRead ? .regular : .semibold)
                         .lineLimit(1)
                     Spacer(minLength: 8)
@@ -209,6 +302,21 @@ private struct MessageRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+                HStack(spacing: 5) {
+                    Text(sender.address ?? "Sender address unavailable")
+                        .lineLimit(1)
+                    if let domain = sender.domain {
+                        Text("· \(domain)")
+                            .lineLimit(1)
+                    }
+                    if sender.mismatchWarning != nil {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("Suspicious sender")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Text(message.subject.isEmpty ? "(No subject)" : message.subject)
                         .fontWeight(message.isRead ? .regular : .semibold)
@@ -249,13 +357,7 @@ private struct MessageDetailView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text(message.subject.isEmpty ? "(No subject)" : message.subject)
                         .font(.title2.weight(.semibold))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(message.sender.isEmpty ? "Unknown sender" : message.sender)
-                            .font(.headline)
-                        Text(message.date)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
+                    SenderDetails(message: message)
                     DisclosureGroup(isExpanded: $detailsExpanded) {
                         Group {
                             if isLoadingDetails {
@@ -277,13 +379,7 @@ private struct MessageDetailView: View {
                             .font(.subheadline.weight(.medium))
                     }
                     Divider()
-                    if message.snippet.isEmpty {
-                        Text("This message has no locally stored preview.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(message.snippet)
-                            .textSelection(.enabled)
-                    }
+                    UntrustedMessagePreview(text: message.snippet)
                 }
                 .frame(maxWidth: 760, alignment: .leading)
                 .padding(32)
@@ -309,24 +405,20 @@ private struct MessageDetailsPanel: View {
                 DetailRow(label: "Bcc", values: details.bcc)
                 DetailRow(label: "Reply-To", values: details.replyTo)
             }
-
             detailSection("Timestamps") {
                 DetailRow(label: "Received", values: [message.date])
                 DetailRow(label: "Sent", values: sentTimestamp.map { [$0] } ?? [])
             }
-
             detailSection("Mailing List") {
                 DetailRow(label: "List-ID", values: details.listId)
                 DetailRow(label: "Post", values: details.listPost)
                 DetailRow(label: "Unsubscribe", values: details.listUnsubscribe)
             }
-
             detailSection("Security") {
                 SecurityStatus(details: details)
                 DetailRow(label: "Authentication-Results", values: details.authenticationResults)
                 DetailRow(label: "Received-SPF", values: details.receivedSpf)
             }
-
             detailSection("Attachments") {
                 if details.attachments.isEmpty {
                     Text("None")
@@ -347,12 +439,8 @@ private struct MessageDetailsPanel: View {
                     }
                 }
             }
-
             detailSection("Headers") {
-                DetailRow(
-                    label: "Message-ID",
-                    values: details.messageId.map { [$0] } ?? []
-                )
+                DetailRow(label: "Message-ID", values: details.messageId.map { [$0] } ?? [])
                 DetailRow(label: "In-Reply-To", values: details.inReplyTo)
                 DetailRow(label: "References", values: details.references)
             }
@@ -443,6 +531,126 @@ private struct SecurityStatus: View {
             return ("Headers report authentication passed", "checkmark.shield", .green)
         }
         return ("Authentication status unavailable", "shield.lefthalf.filled", .secondary)
+    }
+}
+
+private struct SenderDetails: View {
+    let message: MessageSummary
+
+    private var sender: SenderIdentity {
+        SenderIdentity(message.sender)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(sender.displayName)
+                .font(.headline)
+            LabeledContent("Address", value: sender.address ?? "Unavailable")
+            LabeledContent("Domain", value: sender.domain ?? "Unavailable")
+            Text(message.date)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            if let warning = sender.mismatchWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.callout.weight(.medium))
+                    .padding(.top, 5)
+                    .accessibilityLabel("Suspicious sender. \(warning)")
+            }
+        }
+    }
+}
+
+private struct UntrustedMessagePreview: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Message preview · Untrusted content", systemImage: "shield.lefthalf.filled")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if text.isEmpty {
+                Text("This message has no locally stored preview.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(text)
+                    .textSelection(.enabled)
+                ExternalLinksView(text: text)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.secondary.opacity(0.25), lineWidth: 1)
+        }
+    }
+}
+
+private struct ExternalLinksView: View {
+    @Environment(\.openURL) private var openURL
+    @State private var pendingDestination: ExternalLinkDestination?
+
+    let text: String
+
+    private var destinations: [ExternalLinkDestination] {
+        ExternalLinkDestination.detected(in: text)
+    }
+
+    var body: some View {
+        Group {
+            if !destinations.isEmpty {
+                Divider()
+                Text("External links")
+                    .font(.caption.weight(.semibold))
+                ForEach(destinations) { destination in
+                    Button {
+                        pendingDestination = destination
+                    } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: destination.warning == nil ?
+                                "arrow.up.right.square" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(destination.warning == nil ? Color.accentColor : .orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(destination.host)
+                                    .fontWeight(.medium)
+                                Text(destination.url.absoluteString)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .textSelection(.enabled)
+                                if let warning = destination.warning {
+                                    Text(warning)
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows a confirmation with the full destination before opening")
+                }
+            }
+        }
+        .alert(item: $pendingDestination) { destination in
+            Alert(
+                title: Text(destination.warning == nil ? "Open External Link?" : "Open Suspicious Link?"),
+                message: Text(confirmationMessage(for: destination)),
+                primaryButton: .cancel(),
+                secondaryButton: .default(Text("Open")) {
+                    _ = openURL(destination.url)
+                }
+            )
+        }
+    }
+
+    private func confirmationMessage(for destination: ExternalLinkDestination) -> String {
+        [destination.warning, destination.url.absoluteString]
+            .compactMap { $0 }
+            .joined(separator: "\n\n")
     }
 }
 

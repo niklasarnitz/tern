@@ -8,6 +8,7 @@
 use std::{convert::TryFrom, fmt::Debug, sync::Arc, time::Duration};
 
 use async_imap::{
+    extensions::idle::IdleResponse,
     imap_proto::{
         types::{AttributeValue, MessageSection, SectionPath},
         MailboxDatum, Response, Status,
@@ -27,6 +28,7 @@ use tokio_rustls::TlsConnector;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_IDLE_WAIT: Duration = Duration::from_mins(25);
 const MAX_HEADERS: u32 = 100;
 
 mod conversation;
@@ -70,6 +72,16 @@ pub enum ImapError {
     MoveUnsupported,
 }
 
+impl ImapError {
+    /// Whether reconnecting may succeed without changing account configuration.
+    /// Every retry creates a new socket, re-resolves DNS, and therefore follows
+    /// Wi-Fi/cellular and IPv4/IPv6 route changes.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Connection)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ImapError>;
 
 /// Fetch the newest at most 100 headers from the user's INBOX.
@@ -111,7 +123,7 @@ where
     let mailbox = timeout(OPERATION_TIMEOUT, session.examine(remote_name))
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
     let uid_validity = mailbox.uid_validity.ok_or(ImapError::MissingUidMetadata)?;
 
     let headers = if mailbox.exists == 0 {
@@ -128,7 +140,7 @@ where
         )
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
 
         let mut headers = Vec::with_capacity(MAX_HEADERS as usize);
         let mut problem = None;
@@ -137,7 +149,7 @@ where
             let response = timeout(OPERATION_TIMEOUT, session.read_response())
                 .await
                 .map_err(|_| ImapError::Timeout)?
-                .map_err(|_| ImapError::Protocol)?
+                .map_err(|error| classify_io_error(&error))?
                 .ok_or(ImapError::Connection)?;
 
             match response.parsed() {
@@ -162,6 +174,7 @@ where
                     // canonical date for this synchronization snapshot.
                     if let Some(internal_date) = fetch.internal_date.and_then(parse_internal_date) {
                         header.date = internal_date.to_rfc3339();
+                        header.sent_at = Some(internal_date.timestamp());
                     }
                     header.provider_message_id = attributes.iter().find_map(|attribute| {
                         if let AttributeValue::GmailMsgId(value) = attribute {
@@ -224,14 +237,14 @@ pub async fn list_remote_mailboxes(account: &Account, password: &str) -> Result<
     let request_id = timeout(OPERATION_TIMEOUT, session.run_command("LIST \"\" \"*\""))
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
 
     let mut names = Vec::new();
     loop {
         let response = timeout(OPERATION_TIMEOUT, session.read_response())
             .await
             .map_err(|_| ImapError::Timeout)?
-            .map_err(|_| ImapError::Protocol)?
+            .map_err(|error| classify_io_error(&error))?
             .ok_or(ImapError::Connection)?;
         match response.parsed() {
             Response::MailboxData(MailboxDatum::List {
@@ -256,6 +269,75 @@ pub async fn list_remote_mailboxes(account: &Account, password: &str) -> Result<
 
     let _ = timeout(OPERATION_TIMEOUT, session.logout()).await;
     Ok(names)
+}
+
+/// Wait until the Inbox may have changed, or until a periodic refresh is due.
+///
+/// Servers advertising IDLE are monitored for at most 25 minutes before the
+/// connection is renewed. Other servers use the same interval as a polling
+/// delay. A dropped IDLE stream is reported as a retryable connection error so
+/// orchestration can reconnect without holding a stale socket.
+///
+/// # Errors
+/// Returns a sanitized error if configuration, connection, TLS,
+/// authentication, mailbox selection, or IDLE negotiation fails.
+pub async fn wait_for_inbox_change(
+    account: &Account,
+    password: &str,
+    maximum_wait: Duration,
+) -> Result<()> {
+    validate_account(account, password)?;
+    if maximum_wait.is_zero() {
+        return Err(ImapError::InvalidConfiguration);
+    }
+    let session = connect_and_login(account, password).await?;
+    wait_for_mailbox_change_session(session, "INBOX", maximum_wait.min(MAX_IDLE_WAIT)).await
+}
+
+async fn wait_for_mailbox_change_session<T>(
+    mut session: Session<T>,
+    remote_name: &str,
+    maximum_wait: Duration,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let capabilities = timeout(OPERATION_TIMEOUT, session.capabilities())
+        .await
+        .map_err(|_| ImapError::Timeout)?
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
+    timeout(OPERATION_TIMEOUT, session.examine(remote_name))
+        .await
+        .map_err(|_| ImapError::Timeout)?
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
+
+    if !capabilities.has_str("IDLE") {
+        tokio::time::sleep(maximum_wait).await;
+        let _ = timeout(OPERATION_TIMEOUT, session.logout()).await;
+        return Ok(());
+    }
+
+    let mut idle = session.idle();
+    timeout(OPERATION_TIMEOUT, idle.init())
+        .await
+        .map_err(|_| ImapError::Timeout)?
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
+    let response = {
+        let (waiting, _interrupt) = idle.wait_with_timeout(maximum_wait);
+        waiting
+            .await
+            .map_err(|error| classify_imap_error(error, ImapError::Protocol))?
+    };
+    if response == IdleResponse::ManualInterrupt {
+        return Err(ImapError::Connection);
+    }
+
+    let mut session = timeout(OPERATION_TIMEOUT, idle.done())
+        .await
+        .map_err(|_| ImapError::Timeout)?
+        .map_err(|error| classify_imap_error(error, ImapError::Protocol))?;
+    let _ = timeout(OPERATION_TIMEOUT, session.logout()).await;
+    Ok(())
 }
 
 fn validate_account(account: &Account, password: &str) -> Result<()> {
@@ -305,13 +387,13 @@ async fn connect_and_login_with_config(
     let tls_stream = timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Tls)?;
+        .map_err(|error| classify_tls_error(&error))?;
 
     let mut client = Client::new(tls_stream);
     let greeting = timeout(OPERATION_TIMEOUT, client.read_response())
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Protocol)?;
+        .map_err(|error| classify_io_error(&error))?;
     if greeting.is_none() {
         return Err(ImapError::Connection);
     }
@@ -319,8 +401,32 @@ async fn connect_and_login_with_config(
     let session = timeout(OPERATION_TIMEOUT, client.login(&account.username, password))
         .await
         .map_err(|_| ImapError::Timeout)?
-        .map_err(|_| ImapError::Authentication)?;
+        .map_err(|(error, _client)| classify_imap_error(error, ImapError::Authentication))?;
     Ok(session)
+}
+
+fn classify_imap_error(error: async_imap::error::Error, fallback: ImapError) -> ImapError {
+    match error {
+        async_imap::error::Error::Io(error) => classify_io_error(&error),
+        async_imap::error::Error::ConnectionLost => ImapError::Connection,
+        _ => fallback,
+    }
+}
+
+fn classify_io_error(error: &std::io::Error) -> ImapError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        ImapError::Protocol
+    } else {
+        ImapError::Connection
+    }
+}
+
+fn classify_tls_error(error: &std::io::Error) -> ImapError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        ImapError::Tls
+    } else {
+        ImapError::Connection
+    }
 }
 
 fn parse_internal_date(value: &str) -> Option<DateTime<FixedOffset>> {
@@ -388,7 +494,7 @@ fn tls_config() -> Result<ClientConfig> {
 mod tests {
     use std::{fmt::Write as _, sync::Arc, time::Duration};
 
-    use super::{validate_account, ImapError};
+    use super::{classify_tls_error, validate_account, ImapError};
     use async_imap::Client;
     use mail_model::Account;
     use rcgen::generate_simple_self_signed;
@@ -436,6 +542,122 @@ mod tests {
     #[test]
     fn builds_tls_config_with_platform_roots() {
         assert!(super::tls_config().is_ok());
+    }
+
+    #[test]
+    fn retries_transport_tls_failures_but_not_invalid_certificates() {
+        assert_eq!(
+            classify_tls_error(&std::io::Error::from(std::io::ErrorKind::ConnectionReset,)),
+            ImapError::Connection
+        );
+        assert_eq!(
+            classify_tls_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            ImapError::Tls
+        );
+        assert!(ImapError::Connection.is_retryable());
+        assert!(ImapError::Timeout.is_retryable());
+        assert!(!ImapError::Tls.is_retryable());
+        assert!(!ImapError::Authentication.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn dropped_idle_session_is_a_retryable_connection_failure() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut lines = BufReader::new(reader).lines();
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+
+            assert!(lines.next_line().await.unwrap().unwrap().contains("LOGIN"));
+            writer.write_all(b"A0001 OK logged in\r\n").await.unwrap();
+            assert!(lines
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("CAPABILITY"));
+            writer
+                .write_all(b"* CAPABILITY IMAP4rev1 IDLE\r\nA0002 OK capabilities\r\n")
+                .await
+                .unwrap();
+            assert!(lines
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("EXAMINE"));
+            writer
+                .write_all(
+                    b"* FLAGS (\\Seen)\r\n* 0 EXISTS\r\n* OK [UIDVALIDITY 99] valid\r\nA0003 OK [READ-ONLY] examined\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(lines.next_line().await.unwrap().unwrap().contains("IDLE"));
+            writer.write_all(b"+ idling\r\n").await.unwrap();
+        });
+
+        let mut client = Client::new(client_stream);
+        assert!(client.read_response().await.unwrap().is_some());
+        let session = client.login("user", "password").await.unwrap();
+        let result =
+            super::wait_for_mailbox_change_session(session, "INBOX", Duration::from_mins(1)).await;
+        assert_eq!(result, Err(ImapError::Connection));
+        assert!(result.unwrap_err().is_retryable());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_notification_completes_the_command_before_returning() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_stream);
+            let mut lines = BufReader::new(reader).lines();
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+            assert!(lines.next_line().await.unwrap().unwrap().contains("LOGIN"));
+            writer.write_all(b"A0001 OK logged in\r\n").await.unwrap();
+            assert!(lines
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("CAPABILITY"));
+            writer
+                .write_all(b"* CAPABILITY IMAP4rev1 IDLE\r\nA0002 OK capabilities\r\n")
+                .await
+                .unwrap();
+            assert!(lines
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("EXAMINE"));
+            writer
+                .write_all(
+                    b"* FLAGS (\\Seen)\r\n* 0 EXISTS\r\n* OK [UIDVALIDITY 99] valid\r\nA0003 OK [READ-ONLY] examined\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(lines.next_line().await.unwrap().unwrap().contains("IDLE"));
+            writer
+                .write_all(b"+ idling\r\n* 1 EXISTS\r\n")
+                .await
+                .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "DONE");
+            writer.write_all(b"A0004 OK idle done\r\n").await.unwrap();
+            assert!(lines.next_line().await.unwrap().unwrap().contains("LOGOUT"));
+            writer
+                .write_all(b"* BYE closing\r\nA0005 OK logout\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut client = Client::new(client_stream);
+        assert!(client.read_response().await.unwrap().is_some());
+        let session = client.login("user", "password").await.unwrap();
+        super::wait_for_mailbox_change_session(session, "INBOX", Duration::from_mins(1))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

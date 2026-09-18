@@ -31,14 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|uid| {
                     let mut header = RemoteHeader {
                         uid,
-                        message_id: Some(format!("{uid}@example.invalid")),
+                        message_id: Some(format!("<{uid}@example.invalid>")),
                         subject: format!("Offline message {uid}"),
                         sender: "Tern fixture <fixture@example.invalid>".into(),
                         senders: vec!["Tern fixture <fixture@example.invalid>".into()],
                         date: "2026-09-18T09:30:00+00:00".into(),
-                        recipients: vec!["Offline reader <reader@example.invalid>".into()],
+                        recipients: vec!["Reader <reader@example.invalid>".into()],
                         reply_to: vec!["Tern replies <reply@example.invalid>".into()],
-                        sent_at: Some(1_789_713_000),
+                        sent_at: Some(1_789_723_800),
                         list_id: vec!["Tern Updates <updates.tern.example>".into()],
                         list_post: vec!["mailto:updates@tern.example".into()],
                         list_unsubscribe: vec!["https://tern.example/unsubscribe".into()],

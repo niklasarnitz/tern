@@ -1,12 +1,37 @@
 //! Stable application boundary exposed to native frontends via `UniFFI`.
 use mail_db::Database;
-use mail_model::{Account, Mailbox, MessageDetails, MessageSummary};
+use mail_model::{
+    Account, AccountDiscovery, DiscoveryOverrides, Mailbox, MessageDetails, MessageSummary,
+    WidgetSnapshot,
+};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MailError {
     #[error("Local mail storage: {message}")]
     Storage { message: String },
+    #[error("Account discovery: {message}")]
+    Discovery { message: String },
+}
+
+/// Discover an implicit-TLS IMAP configuration without authenticating.
+///
+/// Manual values take precedence over provider presets, domain autoconfig,
+/// DNS SRV records, and conservative hostname guesses.
+///
+/// # Errors
+/// Returns a sanitized error when the email address or override is invalid or
+/// the platform cannot initialize discovery.
+#[uniffi::export]
+pub async fn discover_account(
+    email: String,
+    overrides: DiscoveryOverrides,
+) -> Result<AccountDiscovery, MailError> {
+    mail_autoconfig::discover(&email, &overrides)
+        .await
+        .map_err(|error| MailError::Discovery {
+            message: error.to_string(),
+        })
 }
 fn storage(error: impl std::fmt::Display) -> MailError {
     MailError::Storage {
@@ -82,6 +107,39 @@ impl MailClient {
             .lock()
             .map_err(storage)?
             .message_details(&message_id)
+            .map_err(storage)
+    }
+    /// Search the local cache with free text and structured operators.
+    ///
+    /// # Errors
+    /// Returns a storage error if the query is malformed or the database
+    /// cannot be read.
+    pub fn search_messages(
+        &self,
+        query: String,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .search_messages(&query, offset, limit)
+            .map_err(storage)
+    }
+
+    /// Read bounded widget data for explicitly selected mailboxes.
+    ///
+    /// # Errors
+    /// Returns a storage error if the database cannot be read.
+    pub fn widget_snapshot(
+        &self,
+        mailbox_ids: Vec<String>,
+        important_limit: u32,
+    ) -> Result<WidgetSnapshot, MailError> {
+        self.database
+            .lock()
+            .map_err(storage)?
+            .widget_snapshot(&mailbox_ids, important_limit)
             .map_err(storage)
     }
 }
